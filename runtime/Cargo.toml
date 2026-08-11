@@ -1,0 +1,11 @@
+[package]
+name = "transformer_runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native Rust runtime for the Omegaalfa PHP Transformer project"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]

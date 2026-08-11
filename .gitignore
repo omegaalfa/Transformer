@@ -1,0 +1,10 @@
+/vendor/
+/.phpunit.cache/
+/.phpstan-cache/
+/.php-cs-fixer.cache
+/runtime/target/
+/.idea/
+*.so
+*.dll
+*.dylib
+compile_commands.json
