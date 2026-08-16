@@ -6,16 +6,18 @@ A fase Tensor T1–T10 prova a propriedade nativa, ciclo de vida, metadados,
 materialização e execução ponte-a-ponte para adição, multiplicação matricial, transposição e
 softmax estável. NN-R1 define como essas capacidades se tornam componentes de rede neural sem transformar o tempo de execução em uma coleção não planejada de operadores.
 
-## Descoberta de auditoria: a ponte do handle PHP ainda está pendente
+## Ponte do handle PHP
 
-O ABI C suporta handles nativos de Tensor, mas o caminho alto nível do PHP ainda não os envolve:
+O ABI C e a bridge PHP suportam handles nativos de Tensor:
 
-- `NativeLibrary` atualmente chama apenas as APIs de buffer legadas;
-- `NativeStorage` é um esqueleto não funcional;
-- A construção, metadados e operações do PHP de `Tensor` são esqueletos;
-- Nenhum objeto PHP garante a destruição exclusiva de um handle nativo de Tensor.
+- `NativeLibrary` cria Tensors e também preserva as APIs legadas de buffer;
+- `NativeStorage` possui e destrói exclusivamente cada handle;
+- metadata e operações PHP delegam diretamente à Tensor API;
+- `toFloat32()` torna a materialização uma fronteira explícita.
 
-Portanto, o caminho provado hoje é a execução ponte-a-ponte de handles nativos C ABI, não ainda uma cadeia completa de alto nível do PHP Tensor. Um foco **NN-0 ponte nativo de Tensor** deve fechar esse vazio antes que `Linear` possa executar do PHP. Isso é a integração da ABI Tensor concluída, não um novo núcleo numérico.
+Assim, o gate **NN-0 ponte nativa de Tensor** está concluído. `Linear` e os
+demais módulos podem compor operações residentes sem converter resultados
+intermediários para arrays PHP.
 
 ## Posicionamento das responsabilidades
 
@@ -155,7 +157,7 @@ NN-5 apresenta uma única operação explícita Float32 GELU de referência e op
 
 ```text
 NN-R1  revisão de arquitetura da rede neural                              COMPLETO
-NN-0   ponte nativa do Tensor no PHP                         PENDENTE
+NN-0   ponte nativa do Tensor no PHP                                  COMPLETO
 NN-1   contratos de introspecção e composição para parâmetro e módulo       PENDENTE
 NN-2   Linear com projeção na última dimensão nativa                      PENDENTE
 NN-3   Embedding com pesquisa de token inteiro validada                    PENDENTE
@@ -178,4 +180,3 @@ máscaras, escalas e eixo do softmax antes de qualquer implementação de atenç
 - tipos de dados adicionais apenas para representar a saída do tokenizador;
 - SIMD, BLAS, GPU e blocos Transformer fusos;
 - implementação da atenção antes de NN-R2.
-

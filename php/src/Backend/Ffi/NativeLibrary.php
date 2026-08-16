@@ -7,6 +7,9 @@ namespace Omegaalfa\Transformer\Backend\Ffi;
 use FFI;
 use FFI\CData;
 use Omegaalfa\Transformer\Exception\BackendException;
+use Omegaalfa\Transformer\Tensor\Shape;
+use Omegaalfa\Transformer\Tensor\Storage\NativeStorage;
+use Omegaalfa\Transformer\Tensor\Tensor;
 
 final readonly class NativeLibrary
 {
@@ -50,6 +53,39 @@ final readonly class NativeLibrary
         $version = $this->ffi->transformer_native_version();
 
         return is_string($version) ? $version : FFI::string($version);
+    }
+
+    /** @param list<float> $data */
+    public function tensorFromFloat32(array $data, Shape $shape): Tensor
+    {
+        $dimensions = $shape->dimensions;
+        $expected = $dimensions === [] ? 1 : array_product($dimensions);
+        if ($expected !== count($data)) {
+            throw new BackendException('Native tensor data length does not match its shape.');
+        }
+
+        $dataBuffer = $this->ffi->new('float[' . max(1, count($data)) . ']');
+        foreach ($data as $index => $value) {
+            // @phpstan-ignore offsetAccess.nonOffsetAccessible (FFI C array.)
+            $dataBuffer[$index] = $value;
+        }
+        $rank = count($dimensions);
+        $shapeBuffer = $this->ffi->new('size_t[' . max(1, $rank) . ']');
+        foreach ($dimensions as $axis => $dimension) {
+            // @phpstan-ignore offsetAccess.nonOffsetAccessible (FFI C array.)
+            $shapeBuffer[$axis] = $dimension;
+        }
+        $output = $this->ffi->new('TransformerTensor *[1]');
+        /** @var int $status */
+        // @phpstan-ignore method.notFound (Native methods are defined by FFI::cdef().)
+        $status = $this->ffi->transformer_tensor_create_f32($dataBuffer, $shapeBuffer, $rank, $output);
+        if ($status !== self::STATUS_OK) {
+            throw new BackendException("Native tensor creation failed with status {$status}.");
+        }
+
+        $storage = new NativeStorage($this->ffi, $output[0]);
+
+        return new Tensor($storage->shape(), $storage);
     }
 
     /**

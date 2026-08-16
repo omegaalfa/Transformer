@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Omegaalfa\Transformer\Tensor;
 
 use LogicException;
+use Omegaalfa\Transformer\Tensor\Buffer\Float32Buffer;
+use Omegaalfa\Transformer\Tensor\Storage\NativeStorage;
 use Omegaalfa\Transformer\Tensor\Storage\StorageInterface;
 
 final class Tensor
@@ -48,11 +50,20 @@ final class Tensor
 
     public function ndim(): int
     {
-        throw new LogicException('Tensor metadata is not implemented yet.');
+        return $this->storage instanceof NativeStorage ? $this->storage->rank() : count($this->shape->dimensions);
     }
     public function size(): int
     {
-        throw new LogicException('Tensor metadata is not implemented yet.');
+        if ($this->storage instanceof NativeStorage) {
+            return $this->storage->size();
+        }
+
+        $size = 1;
+        foreach ($this->shape->dimensions as $dimension) {
+            $size *= $dimension;
+        }
+
+        return $size;
     }
     public function reshape(Shape $shape): self
     {
@@ -80,7 +91,7 @@ final class Tensor
     }
     public function add(self $other): self
     {
-        throw new LogicException('Tensor addition is not implemented yet.');
+        return $this->fromNativeBinary($other, 'add');
     }
     public function sub(self $other): self
     {
@@ -112,11 +123,17 @@ final class Tensor
     }
     public function matmul(self $other): self
     {
-        throw new LogicException('Tensor matmul is not implemented yet.');
+        return $this->fromNativeBinary($other, 'matmul');
     }
     public function transpose(?int $axisA = null, ?int $axisB = null): self
     {
-        throw new LogicException('Tensor transpose is not implemented yet.');
+        if ($axisA !== null || $axisB !== null) {
+            throw new LogicException('Native transpose currently supports rank-2 default axes only.');
+        }
+
+        $storage = $this->nativeStorage()->transpose();
+
+        return new self($storage->shape(), $storage);
     }
     public function exp(): self
     {
@@ -128,10 +145,53 @@ final class Tensor
     }
     public function softmax(int $axis = -1): self
     {
-        throw new LogicException('Tensor softmax is not implemented yet.');
+        $rank = count($this->shape->dimensions);
+        if ($rank < 1 || ($axis !== -1 && $axis !== $rank - 1)) {
+            throw new LogicException('Native softmax supports only the last axis.');
+        }
+
+        $nativeStorage = $this->nativeStorage();
+        $storage = $rank === 1 ? $nativeStorage->softmax() : $nativeStorage->softmaxLastDim();
+
+        return new self($storage->shape(), $storage);
     }
     public function gelu(): self
     {
         throw new LogicException('Tensor GELU is not implemented yet.');
+    }
+
+    /** @return list<float> */
+    public function toFloat32(): array
+    {
+        return $this->nativeStorage()->toFloat32();
+    }
+
+    /** Experimental contiguous export that avoids one PHP zval per element. */
+    public function exportFloat32Buffer(): Float32Buffer
+    {
+        return $this->nativeStorage()->exportFloat32Buffer();
+    }
+
+    public function destroy(): void
+    {
+        $this->nativeStorage()->destroy();
+    }
+
+    private function nativeStorage(): NativeStorage
+    {
+        if (!$this->storage instanceof NativeStorage) {
+            throw new LogicException('Operation requires native storage.');
+        }
+
+        return $this->storage;
+    }
+
+    private function fromNativeBinary(self $other, string $operation): self
+    {
+        $left = $this->nativeStorage();
+        $right = $other->nativeStorage();
+        $storage = $operation === 'add' ? $left->add($right) : $left->matmul($right);
+
+        return new self($storage->shape(), $storage);
     }
 }

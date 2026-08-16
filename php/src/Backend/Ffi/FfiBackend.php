@@ -7,6 +7,8 @@ namespace Omegaalfa\Transformer\Backend\Ffi;
 use InvalidArgumentException;
 use Omegaalfa\Transformer\Backend\AbstractBackend;
 use Omegaalfa\Transformer\Backend\BackendType;
+use Omegaalfa\Transformer\Tensor\Shape;
+use Omegaalfa\Transformer\Tensor\Tensor;
 
 final class FfiBackend extends AbstractBackend
 {
@@ -22,6 +24,36 @@ final class FfiBackend extends AbstractBackend
     public function nativeVersion(): string
     {
         return $this->nativeLibrary->version();
+    }
+
+    /** @param array<array-key, mixed> $data */
+    public function tensorFromFloat32(array $data, Shape $shape): Tensor
+    {
+        if (!array_is_list($data)) {
+            throw new InvalidArgumentException('Float32 tensor data must be a list.');
+        }
+
+        return $this->nativeLibrary->tensorFromFloat32($this->normalizeFloat32List($data), $shape);
+    }
+
+    public function matmul(Tensor $left, Tensor $right): Tensor
+    {
+        return $left->matmul($right);
+    }
+
+    public function add(Tensor $left, Tensor $right): Tensor
+    {
+        return $left->add($right);
+    }
+
+    public function softmax(Tensor $tensor, int $axis = -1): Tensor
+    {
+        return $tensor->softmax($axis);
+    }
+
+    public function transpose(Tensor $tensor, ?int $axisA = null, ?int $axisB = null): Tensor
+    {
+        return $tensor->transpose($axisA, $axisB);
     }
 
     /**

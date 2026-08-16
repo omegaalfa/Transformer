@@ -6,10 +6,28 @@
 - `FfiBackend` é o ponteiro de desenvolvimento para o tempo de execução Rust.
 - `NativeExtensionBackend` se tornará o ponteiro de extensão Zend para o mesmo ABI C e tempo de execução Rust.
 
-As operações gerais de Tensor permanecem esqueletos. `FfiBackend::addFloat32()` é uma operação de buffer explícita experimental que valida arrays PHP e delega a `NativeLibrary`:
+`FfiBackend` cria Tensors residentes com `tensorFromFloat32()` e implementa
+`add`, `matmul`, `transpose` e `softmax` sobre handles nativos:
+
+```php
+$tensor = $backend->tensorFromFloat32($values, new Shape([128, 768]));
+$result = $backend->softmax($tensor); // último eixo, sem materialização
+$values = $result->toFloat32();       // copy-out explícito
+```
+
+Fluxo residente:
+
+```text
+Tensor PHP -> NativeStorage -> handle opaco -> kernel Rust -> novo handle
+```
+
+As operações `addFloat32()`, `matmulFloat32()`, `transposeFloat32()` e
+`softmaxFloat32()` continuam disponíveis para compatibilidade e paridade. Elas
+recebem e retornam arrays, portanto fazem cópias na fronteira FFI:
 
 ```text
 FfiBackend -> NativeLibrary -> PHP FFI -> C ABI -> Rust cdylib
 ```
 
-FFI não é uma exigência permanente da API pública; alterar o ponteiro deve não exigir reescrever o tempo de execução.
+FFI não é uma exigência permanente da API pública; trocar a bridge por uma
+extensão Zend não deve exigir reescrever os kernels ou a abstração de Tensor.

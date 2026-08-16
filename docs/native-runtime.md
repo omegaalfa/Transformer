@@ -56,32 +56,42 @@ PHP Tensor
               +-- device
 ```
 
-Native buffers will remain native between operations. Conversion to PHP arrays
-will be explicit. Rust ownership and borrowing will govern native lifetimes;
-the C ABI will expose opaque handles rather than Rust types.
+Native buffers remain native between operations. `NativeStorage` owns the
+opaque handle on the PHP side, and conversion to a PHP array is explicit via
+`Tensor::toFloat32()`. Rust ownership governs native lifetimes; the C ABI never
+exposes Rust types.
 
-## Current copying model
+## Current execution models
 
-The experimental API intentionally performs copies:
+The legacy buffer APIs intentionally perform copies:
 
 ```text
 PHP array -> FFI buffer -> Rust kernel -> FFI buffer -> PHP array
 ```
 
-This is appropriate for validating buffer layout, ABI calls, status handling,
-and numerical parity. It is not the final Transformer execution model because
-copying through PHP between every operation would dominate runtime costs.
+They remain available for compatibility and numerical parity.
 
-Only after the basic reference kernels are stable will PHP Tensor objects hold
-opaque handles to Rust-owned tensors. Operations will then keep buffers in Rust
-memory, and conversion back to PHP arrays will be explicit.
+The production-oriented PHP path uses resident handles:
 
-The intended progression is:
+```text
+PHP array
+    -> tensorFromFloat32()       one copy-in
+    -> Native Tensor
+    -> matmul/add/softmax/...    no PHP materialization
+    -> Native Tensor
+    -> toFloat32()               explicit copy-out
+```
+
+Every operation returns a new owned handle; inputs remain live and unchanged.
+`destroy()` releases a handle early, while the PHP destructor is the fallback.
+
+The implemented progression is:
 
 ```text
 native_version -> add_f32 -> matmul_f32 -> transpose_f32 -> softmax_f32
     -> stable basic operations
     -> Native Tensor / Shape / Strides / DType / opaque handles
+    -> PHP Tensor / NativeStorage resident bridge
 ```
 
 Future kernels include normalization, attention, activation, cache, and
@@ -89,6 +99,6 @@ quantization. SIMD, BLAS, threads, GPU, and optimized matmul follow correctness,
 parity, and profiling. The naive matmul stays available as the numerical
 reference rather than being replaced by optimized implementations.
 
-The 1D softmax reference is numerically stable: it subtracts the maximum input
-before exponentiation, then normalizes by the shifted exponential sum. Axis,
-batch, and multidimensional softmax wait for the Tensor/Shape design.
+The 1D softmax reference remains available and numerically stable. The additive
+`transformer_tensor_softmax_last_dim` operation supports contiguous rank-N
+Tensors and normalizes every row along the last axis in one native call.

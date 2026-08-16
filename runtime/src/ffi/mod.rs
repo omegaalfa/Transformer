@@ -5,7 +5,7 @@ use std::ffi::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::kernels::add::add_f32;
-use crate::kernels::matmul::matmul_f32;
+use crate::kernels::matmul_dispatch::matmul_dispatch_f32;
 use crate::kernels::softmax::softmax_f32;
 use crate::kernels::transpose::transpose_f32;
 
@@ -119,7 +119,7 @@ pub unsafe extern "C" fn transformer_matmul_f32(
         };
         let output = unsafe { std::slice::from_raw_parts_mut(output, output_length) };
 
-        match matmul_f32(a, b, output, m, k, n) {
+        match matmul_dispatch_f32(a, b, output, m, k, n) {
             Ok(()) => STATUS_OK,
             Err(_) => STATUS_INVALID_ARGUMENT,
         }

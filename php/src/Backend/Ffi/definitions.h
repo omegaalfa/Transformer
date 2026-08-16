@@ -61,6 +61,11 @@ int transformer_tensor_softmax(
     TransformerTensor** output
 );
 
+int transformer_tensor_softmax_last_dim(
+    const TransformerTensor* input,
+    TransformerTensor** output
+);
+
 int transformer_tensor_add_f32(
     const float* a,
     const float* b,

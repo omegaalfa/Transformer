@@ -44,9 +44,34 @@ pub fn softmax_f32(input: &[f32], output: &mut [f32]) -> Result<(), SoftmaxError
     Ok(())
 }
 
+/// Computes independent softmax rows over the last dimension of a contiguous
+/// row-major buffer.
+pub fn softmax_last_dim_f32(
+    input: &[f32],
+    output: &mut [f32],
+    last_dim: usize,
+) -> Result<(), SoftmaxError> {
+    if input.is_empty() || last_dim == 0 {
+        return Err(SoftmaxError::EmptyInput);
+    }
+
+    if input.len() != output.len() || input.len() % last_dim != 0 {
+        return Err(SoftmaxError::LengthMismatch);
+    }
+
+    for (input_row, output_row) in input
+        .chunks_exact(last_dim)
+        .zip(output.chunks_exact_mut(last_dim))
+    {
+        softmax_f32(input_row, output_row)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{softmax_f32, SoftmaxError};
+    use super::{softmax_f32, softmax_last_dim_f32, SoftmaxError};
 
     const TOLERANCE: f32 = 1.0e-5;
     const EXPECTED: [f32; 3] = [0.090_030_57, 0.244_728_48, 0.665_240_94];
@@ -109,6 +134,59 @@ mod tests {
         assert_eq!(
             softmax_f32(&[f32::INFINITY], &mut output),
             Err(SoftmaxError::NonFiniteInput)
+        );
+    }
+
+    #[test]
+    fn computes_multiple_rows_over_the_last_dimension() {
+        let input = [1.0, 2.0, 3.0, -3.0, -2.0, -1.0];
+        let mut output = [0.0; 6];
+
+        assert_eq!(softmax_last_dim_f32(&input, &mut output, 3), Ok(()));
+        assert_approximately_equal(&output[..3], &EXPECTED);
+        assert_approximately_equal(&output[3..], &EXPECTED);
+        assert!((output[..3].iter().sum::<f32>() - 1.0).abs() <= TOLERANCE);
+        assert!((output[3..].iter().sum::<f32>() - 1.0).abs() <= TOLERANCE);
+    }
+
+    #[test]
+    fn rank_one_last_dimension_matches_existing_softmax() {
+        let input = [1000.0, 1001.0, 1002.0];
+        let mut expected = [0.0; 3];
+        let mut actual = [0.0; 3];
+
+        softmax_f32(&input, &mut expected).unwrap();
+        softmax_last_dim_f32(&input, &mut actual, 3).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn supports_small_and_transformer_sized_last_dimensions() {
+        for last_dim in [1, 2, 768] {
+            let input: Vec<f32> = (0..2 * last_dim)
+                .map(|index| index as f32 * 0.001 - 2.0)
+                .collect();
+            let mut output = vec![0.0; input.len()];
+
+            softmax_last_dim_f32(&input, &mut output, last_dim).unwrap();
+
+            for row in output.chunks_exact(last_dim) {
+                assert!((row.iter().sum::<f32>() - 1.0).abs() <= 1.0e-4);
+                assert!(row.iter().all(|value| value.is_finite()));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_empty_or_incompatible_last_dimension() {
+        assert_eq!(
+            softmax_last_dim_f32(&[], &mut [], 0),
+            Err(SoftmaxError::EmptyInput)
+        );
+        assert_eq!(
+            softmax_last_dim_f32(&[1.0, 2.0, 3.0], &mut [0.0; 3], 2),
+            Err(SoftmaxError::LengthMismatch)
         );
     }
 }

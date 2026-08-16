@@ -9,3 +9,11 @@ description = "Native Rust runtime for the Omegaalfa PHP Transformer project"
 crate-type = ["cdylib"]
 
 [dependencies]
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[[bench]]
+name = "graph"
+harness = false

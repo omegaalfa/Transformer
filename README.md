@@ -56,11 +56,11 @@ A fase fundamental do Tensor nativo, dividida nos gates T1–T10, está concluí
 | Metadata e copy-out explícito | ✅ |
 | Add, matmul, transpose e softmax | ✅ |
 | Paridade com as APIs de buffers | ✅ |
-| Bridge de Tensor nativo no PHP | ⬜ |
+| Bridge de Tensor nativo no PHP | ✅ |
 | Camada NN | ⬜ |
 | Attention e Transformer | ⬜ |
 
-As operações entre handles já permanecem inteiramente no Rust:
+As operações entre handles permanecem inteiramente no Rust:
 
 ```text
 Tensor* A ─┐
@@ -68,7 +68,7 @@ Tensor* A ─┐
 Tensor* B ─┘
 ```
 
-Isso permite encadear, no nível da ABI:
+Isso permite encadear diretamente pela API PHP:
 
 ```text
 Tensor
@@ -78,10 +78,9 @@ Tensor
                     └─► Tensor
 ```
 
-Nenhuma dessas etapas precisa materializar os dados no PHP. O próximo gate,
-**NN-0**, conectará essa infraestrutura à classe PHP `Tensor` e ao
-`NativeStorage`. Até lá, a API PHP de alto nível permanece parcialmente
-estrutural; os exemplos PHP funcionais utilizam as APIs de buffers já validadas.
+`Tensor` mantém um `NativeStorage` proprietário. Cada operação retorna outro
+Tensor residente, sem converter resultados intermediários em arrays PHP. A
+conversão acontece somente quando o usuário chama `toFloat32()`.
 
 ## Operações nativas disponíveis
 
@@ -100,7 +99,8 @@ estrutural; os exemplos PHP funcionais utilizam as APIs de buffers já validadas
 - `transformer_tensor_add`;
 - `transformer_tensor_matmul`;
 - `transformer_tensor_transpose`;
-- `transformer_tensor_softmax`.
+- `transformer_tensor_softmax` para vetores;
+- `transformer_tensor_softmax_last_dim` para Tensor rank-N.
 
 As APIs de buffers continuam preservadas como referência numérica para testes
 de paridade. Elas não serão removidas até que a camada baseada em handles esteja
@@ -140,6 +140,8 @@ raw pointers
 Documentação arquitetural:
 
 - [Arquitetura geral](docs/architecture.md)
+- [Uso do Tensor no PHP](docs/tensor.md)
+- [Backends](docs/backend.md)
 - [Runtime nativo](docs/native-runtime.md)
 - [Design do Tensor nativo](docs/native-tensor-design.md)
 - [Revisão da camada NN](docs/nn-design.md)
@@ -189,13 +191,66 @@ Artefatos esperados:
 
 Depois do build release:
 
+Os exemplos `02`–`05` mantêm as APIs de array para demonstrar compatibilidade;
+o exemplo `06` mostra o fluxo residente recomendado para pipelines.
+
 ```bash
 php examples/ffi/01-native-version.php
 php examples/ffi/02-tensor-add.php
 php examples/ffi/03-matmul.php
 php examples/ffi/04-transpose.php
 php examples/ffi/05-softmax.php
+php examples/ffi/06-native-tensor-pipeline.php
 ```
+
+### Início rápido: Tensor residente
+
+```php
+<?php
+
+use Omegaalfa\Transformer\Backend\Ffi\FfiBackend;
+use Omegaalfa\Transformer\Backend\Ffi\NativeLibrary;
+use Omegaalfa\Transformer\Tensor\Shape;
+
+require __DIR__ . '/vendor/autoload.php';
+
+$backend = new FfiBackend(new NativeLibrary(
+    NativeLibrary::defaultPath(__DIR__),
+));
+
+$input = $backend->tensorFromFloat32(
+    [1, 2, 3, 4, 5, 6],
+    new Shape([2, 3]),
+);
+
+// Uma chamada nativa: cada linha é normalizada no último eixo.
+$output = $input->softmax();
+
+print_r(array_chunk($output->toFloat32(), 3));
+
+// Opcional: libera imediatamente. O destrutor também funciona como fallback.
+$output->destroy();
+$input->destroy();
+```
+
+Execute a partir da raiz do projeto, depois do build release:
+
+```bash
+php examples/ffi/05-softmax.php
+```
+
+Saída aproximada para as duas linhas:
+
+```text
+[
+  [0.09003057, 0.24472848, 0.66524094],
+  [0.09003057, 0.24472848, 0.66524094]
+]
+```
+
+`tensorFromFloat32()` faz a cópia inicial do array PHP. `matmul()`, `add()`,
+`softmax()` e `transpose()` mantêm os dados no runtime. `toFloat32()` é a
+fronteira explícita que copia o resultado de volta para PHP.
 
 Resultados de referência:
 
@@ -245,10 +300,10 @@ cargo clippy \
 cargo build --manifest-path runtime/Cargo.toml --release
 ```
 
-Estado validado no encerramento da fase T1–T10:
+Estado validado após a bridge PHP e o softmax no último eixo:
 
-- **90 testes Rust**;
-- **20 testes PHP / 47 asserções**;
+- **107 testes Rust**;
+- **28 testes PHP / 98.373 asserções**;
 - Clippy sem warnings;
 - PHPStan sem erros;
 - PHP CS Fixer limpo;
@@ -262,7 +317,7 @@ FASE TENSOR
 
 FASE NN
   NN-R1  revisão arquitetural                 ✅ concluída
-  NN-0   bridge PHP para Tensor nativo        ⬜ próximo
+  NN-0   bridge PHP para Tensor nativo        ✅ concluída
   NN-1   Parameter + Module                   ⬜
   NN-2   Linear                               ⬜
   NN-3   Embedding                            ⬜

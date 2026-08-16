@@ -3,8 +3,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use crate::kernels::add::add_f32;
-use crate::kernels::matmul::matmul_f32;
-use crate::kernels::softmax::softmax_f32;
+use crate::kernels::matmul_dispatch::matmul_dispatch_f32;
+use crate::kernels::softmax::{softmax_f32, softmax_last_dim_f32};
 use crate::kernels::transpose::transpose_f32;
 use crate::tensor::{DType, Shape, Tensor};
 
@@ -349,7 +349,7 @@ pub unsafe extern "C" fn transformer_tensor_matmul(
             return STATUS_INVALID_ARGUMENT;
         };
         let mut values = vec![0.0; shape.numel()];
-        if matmul_f32(a.as_slice(), b.as_slice(), &mut values, m, k, n).is_err() {
+        if matmul_dispatch_f32(a.as_slice(), b.as_slice(), &mut values, m, k, n).is_err() {
             return STATUS_INVALID_ARGUMENT;
         }
 
@@ -449,6 +449,62 @@ pub unsafe extern "C" fn transformer_tensor_softmax(
 
         let mut values = vec![0.0; input.numel()];
         if softmax_f32(input.as_slice(), &mut values).is_err() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let shape = input.shape().clone();
+        let Ok(tensor) = Tensor::from_vec(values, shape) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
+
+        // SAFETY: `output` is valid by the caller contract and written once.
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Computes a numerically stable softmax over the last dimension of a
+/// contiguous, non-empty rank-N Float32 Tensor and returns a new owned Tensor.
+///
+/// # Safety
+///
+/// `input` must point to a live handle for the duration of the call. `output`
+/// must be writable for one handle pointer and must not alias the input handle.
+/// The input handle remains valid and unchanged on success.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_tensor_softmax_last_dim(
+    input: *const TransformerTensor,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: `output` is non-null and writable by the caller contract.
+    unsafe { output.write(ptr::null_mut()) };
+
+    if input.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees a live immutable handle.
+        let input = unsafe { &*input }.tensor();
+        if input.dtype() != DType::Float32 || input.rank() == 0 || input.is_empty() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let Some(&last_dim) = input.shape().as_slice().last() else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        if last_dim == 0 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let mut values = vec![0.0; input.numel()];
+        if softmax_last_dim_f32(input.as_slice(), &mut values, last_dim).is_err() {
             return STATUS_INVALID_ARGUMENT;
         }
 
@@ -1359,6 +1415,190 @@ mod tests {
 
         unsafe { destroy(output) };
         unsafe { destroy(input) };
+    }
+
+    #[test]
+    fn tensor_softmax_last_dim_normalizes_each_matrix_row() {
+        let data = [1.0, 2.0, 3.0, -3.0, -2.0, -1.0];
+        let shape = [2, 3];
+        let mut input = null_mut();
+        let mut output = null_mut();
+        assert_eq!(
+            unsafe { transformer_tensor_create_f32(data.as_ptr(), shape.as_ptr(), 2, &mut input) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { transformer_tensor_softmax_last_dim(input, &mut output) },
+            STATUS_OK
+        );
+
+        let mut output_shape = [0; 2];
+        let mut values = [0.0; 6];
+        assert_eq!(
+            unsafe { transformer_tensor_shape(output, output_shape.as_mut_ptr(), 2) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { transformer_tensor_copy_data_f32(output, values.as_mut_ptr(), values.len()) },
+            STATUS_OK
+        );
+        assert_eq!(output_shape, shape);
+        for row in values.chunks_exact(3) {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+            for (actual, expected) in row.iter().zip([0.090_030_57, 0.244_728_48, 0.665_240_94]) {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+        }
+        let mut input_after = [0.0; 6];
+        assert_eq!(
+            unsafe {
+                transformer_tensor_copy_data_f32(input, input_after.as_mut_ptr(), input_after.len())
+            },
+            STATUS_OK
+        );
+        assert_eq!(input_after, data);
+
+        unsafe { destroy(output) };
+        unsafe { destroy(input) };
+    }
+
+    #[test]
+    fn tensor_softmax_last_dim_matches_rank_one_operation_and_supports_rank_n() {
+        let vector = [1000.0, 1001.0, 1002.0];
+        let vector_shape = [3];
+        let rank_three_data = [1.0, 2.0, 3.0, 3.0, 2.0, 1.0];
+        let rank_three_shape = [1, 2, 3];
+        let mut vector_input = null_mut();
+        let mut old_output = null_mut();
+        let mut new_output = null_mut();
+        let mut rank_three_input = null_mut();
+        let mut rank_three_output = null_mut();
+
+        assert_eq!(
+            unsafe {
+                transformer_tensor_create_f32(
+                    vector.as_ptr(),
+                    vector_shape.as_ptr(),
+                    1,
+                    &mut vector_input,
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { transformer_tensor_softmax(vector_input, &mut old_output) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { transformer_tensor_softmax_last_dim(vector_input, &mut new_output) },
+            STATUS_OK
+        );
+        let mut old_values = [0.0; 3];
+        let mut new_values = [0.0; 3];
+        assert_eq!(
+            unsafe { transformer_tensor_copy_data_f32(old_output, old_values.as_mut_ptr(), 3) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { transformer_tensor_copy_data_f32(new_output, new_values.as_mut_ptr(), 3) },
+            STATUS_OK
+        );
+        assert_eq!(new_values, old_values);
+
+        assert_eq!(
+            unsafe {
+                transformer_tensor_create_f32(
+                    rank_three_data.as_ptr(),
+                    rank_three_shape.as_ptr(),
+                    3,
+                    &mut rank_three_input,
+                )
+            },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe {
+                transformer_tensor_softmax_last_dim(rank_three_input, &mut rank_three_output)
+            },
+            STATUS_OK
+        );
+        let mut values = [0.0; 6];
+        assert_eq!(
+            unsafe {
+                transformer_tensor_copy_data_f32(
+                    rank_three_output,
+                    values.as_mut_ptr(),
+                    values.len(),
+                )
+            },
+            STATUS_OK
+        );
+        for row in values.chunks_exact(3) {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1.0e-6);
+        }
+
+        for handle in [
+            rank_three_output,
+            rank_three_input,
+            new_output,
+            old_output,
+            vector_input,
+        ] {
+            unsafe { destroy(handle) };
+        }
+    }
+
+    #[test]
+    fn tensor_softmax_last_dim_rejects_empty_scalar_non_finite_and_null_arguments() {
+        let empty_shape = [2, 0];
+        let scalar_data = [1.0];
+        let invalid_data = [1.0, f32::INFINITY];
+        let invalid_shape = [1, 2];
+        let mut empty = null_mut();
+        let mut scalar = null_mut();
+        let mut invalid = null_mut();
+        assert_eq!(
+            unsafe { transformer_tensor_create_f32(null(), empty_shape.as_ptr(), 2, &mut empty) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { transformer_tensor_create_f32(scalar_data.as_ptr(), null(), 0, &mut scalar) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe {
+                transformer_tensor_create_f32(
+                    invalid_data.as_ptr(),
+                    invalid_shape.as_ptr(),
+                    2,
+                    &mut invalid,
+                )
+            },
+            STATUS_OK
+        );
+
+        for input in [empty, scalar, invalid] {
+            let mut output = std::ptr::NonNull::<TransformerTensor>::dangling().as_ptr();
+            assert_eq!(
+                unsafe { transformer_tensor_softmax_last_dim(input, &mut output) },
+                STATUS_INVALID_ARGUMENT
+            );
+            assert!(output.is_null());
+        }
+        let mut output = std::ptr::NonNull::<TransformerTensor>::dangling().as_ptr();
+        assert_eq!(
+            unsafe { transformer_tensor_softmax_last_dim(null(), &mut output) },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert!(output.is_null());
+        assert_eq!(
+            unsafe { transformer_tensor_softmax_last_dim(invalid, null_mut()) },
+            STATUS_INVALID_ARGUMENT
+        );
+
+        for handle in [invalid, scalar, empty] {
+            unsafe { destroy(handle) };
+        }
     }
 
     #[test]

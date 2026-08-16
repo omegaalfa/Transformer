@@ -7,7 +7,7 @@
 - [ ] **Milestone E** — Zend extension consuming the Rust C ABI.
 - [ ] **Milestone F** — real encoder and Safetensors.
 - [ ] **Milestone G** — ContextEngine integration.
-- [ ] **Milestone H** — SIMD, BLAS, and threads after profiling.
+- [ ] **Milestone H** — CPU optimization after profiling (tiled matmul and optional BLAS complete; SIMD and threads pending).
 - [ ] **Milestone I** — decoder and KV cache.
 - [ ] **Milestone J** — quantization and GPU.
 
@@ -21,8 +21,9 @@ ContextEngine
                 -> embedding
 ```
 
-The naive `matmul_f32` reference kernel is implemented and covered by manually
-calculated small matrices. No optimized implementation exists.
+The scalar `matmul_f32` reference remains available. Cache-friendly and tiled
+Rust kernels plus an optional OpenBLAS SGEMM backend are selected by an isolated
+production dispatcher for benchmarked Transformer shapes.
 
 ## Native runtime detail
 
@@ -36,8 +37,10 @@ calculated small matrices. No optimized implementation exists.
 - [x] Naive reference `matmul_f32`.
 - [x] `transpose_f32` with explicit row-major shape/layout mapping.
 - [x] Numerically stable one-dimensional `softmax_f32`.
-- [ ] Native Tensor and opaque handles.
-- [ ] Native Shape, strides, dtype, and storage.
+- [x] Native Tensor and opaque handles.
+- [x] Native Shape, strides, dtype, and storage.
+- [x] Rank-N softmax over the last dimension.
+- [x] Resident PHP Tensor/NativeStorage bridge.
 - [ ] Linear, Embedding, LayerNorm, and Attention execution.
 
 The initial `matmul_f32` must be a straightforward safe reference kernel. SIMD,
@@ -74,7 +77,7 @@ into gates T1–T10; all ten gates are complete.
 The NN architecture review is complete and did not add numerical code:
 
 - [x] **NN-R1** — Parameter, Module, PHP/Rust boundary, and dependency design.
-- [ ] **NN-0** — high-level PHP bridge for native Tensor handles.
+- [x] **NN-0** — high-level PHP bridge for native Tensor handles.
 - [ ] **NN-1** — Parameter and Module introspection contracts.
 - [ ] **NN-2** — Linear with native last-dimension projection and bias.
 - [ ] **NN-3** — Embedding with validated integer lookup.

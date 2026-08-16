@@ -10,15 +10,15 @@ use Omegaalfa\Transformer\Tensor\Tensor;
 
 abstract class AbstractBackend implements BackendInterface
 {
-    final public function matmul(Tensor $left, Tensor $right): Tensor
+    public function matmul(Tensor $left, Tensor $right): Tensor
     {
         throw $this->notImplemented('matmul');
     }
-    final public function transpose(Tensor $tensor, ?int $axisA = null, ?int $axisB = null): Tensor
+    public function transpose(Tensor $tensor, ?int $axisA = null, ?int $axisB = null): Tensor
     {
         throw $this->notImplemented('transpose');
     }
-    final public function add(Tensor $left, Tensor $right): Tensor
+    public function add(Tensor $left, Tensor $right): Tensor
     {
         throw $this->notImplemented('add');
     }
@@ -38,7 +38,7 @@ abstract class AbstractBackend implements BackendInterface
     {
         throw $this->notImplemented('reshape');
     }
-    final public function softmax(Tensor $tensor, int $axis = -1): Tensor
+    public function softmax(Tensor $tensor, int $axis = -1): Tensor
     {
         throw $this->notImplemented('softmax');
     }
