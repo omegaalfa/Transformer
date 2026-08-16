@@ -1,210 +1,181 @@
-# Neural-network architecture review (NN-R1)
+# Revisão da Arquitetura de Redes Neurais (NN-R1)
 
-Status: **approved design review; no NN implementation is authorized by this document**.
+Status: **revisão de design aprovada; nenhum desenvolvimento de implementação de rede neural é autorizado por este documento**.
 
-The Tensor phase T1–T10 proves native ownership, lifecycle, metadata,
-materialization, and handle-to-handle execution for add, matmul, transpose, and
-stable softmax. NN-R1 defines how those capabilities become neural-network
-components without turning the runtime into an unplanned collection of
-operators.
+A fase Tensor T1–T10 prova a propriedade nativa, ciclo de vida, metadados,
+materialização e execução ponte-a-ponte para adição, multiplicação matricial, transposição e
+softmax estável. NN-R1 define como essas capacidades se tornam componentes de rede neural sem transformar o tempo de execução em uma coleção não planejada de operadores.
 
-## Audit finding: the PHP handle bridge is still pending
+## Descoberta de auditoria: a ponte do handle PHP ainda está pendente
 
-The C ABI supports native Tensor handles, but the high-level PHP path does not
-yet wrap them:
+O ABI C suporta handles nativos de Tensor, mas o caminho alto nível do PHP ainda não os envolve:
 
-- `NativeLibrary` currently calls only the legacy buffer APIs;
-- `NativeStorage` is a non-functional skeleton;
-- PHP `Tensor` construction, metadata, and operations are skeletons;
-- no PHP object currently guarantees exactly-once destruction of a native
-  Tensor handle.
+- `NativeLibrary` atualmente chama apenas as APIs de buffer legadas;
+- `NativeStorage` é um esqueleto não funcional;
+- A construção, metadados e operações do PHP de `Tensor` são esqueletos;
+- Nenhum objeto PHP garante a destruição exclusiva de um handle nativo de Tensor.
 
-Therefore, the proven path today is native C ABI handle-to-handle execution,
-not yet an end-to-end high-level PHP Tensor chain. A focused **NN-0 native
-Tensor bridge** must close this gap before `Linear` can execute from PHP. This
-is integration of the completed Tensor ABI, not a new numerical kernel.
+Portanto, o caminho provado hoje é a execução ponte-a-ponte de handles nativos C ABI, não ainda uma cadeia completa de alto nível do PHP Tensor. Um foco **NN-0 ponte nativo de Tensor** deve fechar esse vazio antes que `Linear` possa executar do PHP. Isso é a integração da ABI Tensor concluída, não um novo núcleo numérico.
 
-## Placement of responsibilities
+## Posicionamento das responsabilidades
 
-The architecture is deliberately split:
+A arquitetura é deliberadamente dividida:
 
 ```text
 PHP
-  model composition
-  Module and Parameter metadata
-  parameter names and state dictionaries
-  validation and user-facing exceptions
-  tokenizer output and model configuration
+  composição de modelos
+  metadados de módulo e parâmetro
+  nomes de parâmetros e dicionários de estado
+  validação e exceções de interface do usuário
+  saída do tokenizador e configuração do modelo
 
 Rust
-  Tensor storage and lifecycle
-  shape/dtype invariants
-  numerical execution
-  operation-specific validation at the C ABI
-  newly allocated result Tensors
+  armazenamento e ciclo de vida do Tensor
+  invariantes de forma/dtype
+  execução numérica
+  validação específica da operação no ABI C
+  novos tensores resultantes alocados
 ```
 
-`Linear`, `Embedding`, `LayerNorm`, `GELU`, and later Transformer blocks are
-PHP composition objects. Their numerical work stays in Rust. They must never
-copy native Tensor data to PHP between operations.
+`Linear`, `Embedding`, `LayerNorm`, `GELU` e blocos Transformer posteriores são objetos de composição PHP. Seu trabalho numérico permanece em Rust. Eles nunca devem copiar dados nativos do Tensor para o PHP entre operações.
 
-## Parameter contract
+## Contrato de parâmetro
 
-`Parameter` is not a second Tensor implementation. It wraps one PHP `Tensor`
-whose storage may own a native handle, plus model metadata:
+`Parameter` não é uma segunda implementação de Tensor. Ele envolve um único `Tensor` PHP cujo armazenamento pode possuir um handle nativo, mais metadados do modelo:
 
 ```text
 Parameter
-  name: local module name
+  nome: nome local do módulo
   tensor: Tensor
-  trainable: bool
+  treinável: bool
 ```
 
-Rules for v1:
+Regras para v1:
 
-- shape, strides, dtype, device, and storage exist only in Tensor;
-- Parameter never duplicates or mutates Tensor storage;
-- `trainable` is descriptive metadata; v1 is inference-only;
-- there is no gradient, optimizer, autograd graph, or training state;
-- parameters may be read by multiple modules because Tensor operations are
-  immutable, while native handle destruction remains owned by `NativeStorage`;
-- module traversal produces qualified names such as `encoder.layer0.weight`;
-  Parameter stores only its local name.
+- forma, passos, dtype, dispositivo e armazenamento existem apenas em Tensor;
+- Parameter nunca duplica ou muta o armazenamento de Tensor;
+- `treinável` é metadados descritivos; v1 é apenas inferência;
+- não há gradiente, otimizador, gráfico autograd ou estado de treinamento;
+- os parâmetros podem ser lidos por vários módulos porque as operações do Tensor são imutáveis, enquanto a destruição exclusiva do handle nativo permanece com `NativeStorage`;
+- a navegação dos módulos produz nomes qualificados como `encoder.layer0.weight`;
+  Parameter armazena apenas seu nome local.
 
-## Module contract
+## Contrato de módulo
 
-The current `Module::forward(Tensor): Tensor` signature is too restrictive as a
-universal interface. Embedding begins with token IDs, and later attention also
-accepts masks. NN-1 should make `Module` the introspection/composition contract:
+A assinatura atual da `Module::forward(Tensor): Tensor` é muito restritiva como uma interface universal. Embedding começa com IDs de token, e mais tarde a atenção também aceita máscaras. NN-1 deve tornar `Module` o contrato de introspecção/composição:
 
 ```text
-parameters() -> map<string, Parameter>
-modules()    -> map<string, Module>
+parâmetros() -> map<string, Parameter>
+módulos()    -> map<string, Module>
 ```
 
-Concrete modules declare their own typed `forward` method. Tensor-to-Tensor
-components such as `Linear`, `LayerNorm`, and `GELU` retain
-`forward(Tensor): Tensor`. Explicit maps are preferred over reflection or magic
-property discovery. Recursive traversal builds a deterministic state dict.
+Módulos concretos declaram seus próprios métodos `forward` tipados. Componentes Tensor-to-Tensor como `Linear`, `LayerNorm` e `GELU` mantêm
+`forward(Tensor): Tensor`. Mapas explícitos são preferidos sobre reflexão ou descoberta de propriedades mágicas. A navegação recursiva constrói um dicionário de estado determinístico.
 
-Leaf modules receive a `Runtime` explicitly and dispatch through its backend.
-Inputs, parameters, and results must use compatible backend, device, and dtype.
-The PHP objects know neither FFI pointers nor Rust layouts.
+Módulos folha recebem explicitamente um `Runtime` e despacham através do seu backend.
+As entradas, parâmetros e resultados devem usar backends compatíveis, dispositivos e dtypes.
+Os objetos PHP não sabem nem ponteiros FFI nem layouts Rust.
 
-## Native handle ownership in PHP
+## Propriedade de handle nativo no PHP
 
-NN-0 must introduce one PHP owner for each native handle, conceptually
+NN-0 deve introduzir um proprietário PHP para cada handle nativo, conceitualmente
 `NativeStorage`:
 
-- construction receives a live opaque handle;
-- copying a PHP object reference does not duplicate the handle;
-- its destructor calls native destroy at most once;
-- a released/moved handle cannot be used again;
-- operation results create new `NativeStorage` owners;
-- metadata is cached only if it is immutable and verified from the ABI;
-- `toArray()` is the only explicit data materialization boundary.
+- a construção recebe um handle opaco vivo;
+- copiar uma referência do objeto PHP não duplica o handle;
+- seu destruidor chama a destruição nativa no máximo uma vez;
+- um handle liberado/movido não pode ser usado novamente;
+- resultados das operações criam novos proprietários `NativeStorage`;
+- metadados são armazenados apenas se forem imutáveis e verificados do ABI;
+- `toArray()` é a única fronteira explícita de materialização de dados.
 
-Backend operations accept PHP Tensors and delegate native-handle operations to
-`NativeLibrary`. No intermediate PHP arrays are allowed in an NN forward pass.
+As operações de backend aceitam tensores PHP e delegam operações de handle nativo para
+`NativeLibrary`. Nenhuma matriz PHP intermediária é permitida em uma passagem de frente para trás da rede neural.
 
-## Module dependency map
+## Mapa de dependência de módulos
 
 ### Linear
 
 ```text
 Linear
-  weight Parameter
-  optional bias Parameter
-  native last-dimension projection
+  peso Parameter
+  opcional bias Parameter
+  projeção final na última dimensão nativa
 ```
 
-The current strict Tensor add cannot add bias `[out_features]` to
-`[rows, out_features]`, and current matmul accepts rank 2 only. Transformer
-inputs will eventually have leading dimensions such as
-`[batch, sequence, hidden]`. NN-2 should therefore design one specific native
-Linear operation that:
+A adição Tensor atual estrita não pode adicionar um bias `[out_features]` a
+`[rows, out_features]`, e a multiplicação matmul aceita apenas rango 2. As entradas do Transformer eventualmente terão dimensões de leitura como
+`[batch, sequence, hidden]`. NN-2 deve, portanto, projetar uma única operação nativa Linear específica que:
 
-- requires the input's last dimension to equal `input_features`;
-- treats preceding dimensions as rows without exposing a PHP copy;
-- multiplies by weight shaped `[input_features, output_features]`;
-- adds optional bias shaped `[output_features]` inside the same native path;
-- preserves all leading dimensions and replaces only the last one;
-- returns a new contiguous Tensor.
+- exija que a última dimensão da entrada seja igual a `input_features`;
+- trate as dimensões anteriores como linhas sem expor uma cópia PHP;
+- multiplica por peso de forma `[input_features, output_features]`;
+- adiciona opcionalmente bias de forma `[output_features]` dentro do mesmo caminho nativo;
+- preserva todas as dimensões anteriores e substitui apenas a última;
+- retorna um novo Tensor contínuo.
 
-This avoids prematurely adding general broadcasting or reshape/view semantics.
-The reference tests still compare its matmul portion with the naive kernel.
+Isso evita adicionar prematuramente semântica de broadcasting ou reshape/view genéricos.
+Os testes de referência ainda comparam sua parte de multiplicação com o núcleo básico.
 
 ### Embedding
 
 ```text
 Embedding
-  weight Parameter [vocabulary_size, dimensions]
-  token IDs
-  gather rows
+  peso Parameter [vocabulary_size, dimensions]
+  IDs de token
+  coleta linhas
 ```
 
-Token IDs must not be encoded as Float32. Because tokenizer output originates
-in PHP and Tensor v1 intentionally supports only Float32, NN-3 should initially
-define a dedicated embedding lookup boundary accepting validated integer token
-IDs and a Float32 weight handle. It returns a native Float32 Tensor and performs
-only one PHP-to-native transfer at the model input boundary. A general integer
-Tensor dtype is deferred until another real consumer justifies it.
+IDs de token não devem ser codificados como Float32. Porque a saída do tokenizador origina-se em PHP e Tensor v1 intencionalmente suporta apenas Float32, NN-3 deve inicialmente definir uma fronteira dedicada de pesquisa de embedding aceitando IDs de token inteiro validados e um handle de peso Float32. Ele retorna um Tensor nativo Float32 e realiza apenas uma transferência PHP-to-native no limite de entrada do modelo. Um tipo de dado Tensor genérico inteiro é adiado até que outro consumidor real justifique isso.
 
-Validation includes non-negative IDs, vocabulary bounds, output shape, and
-integer-width conversion. A general-purpose gather operator is not required
-before this contract is proven.
+A validação inclui IDs não negativos, limites de vocabulário, forma de saída e conversão de largura de inteiro. Um operador de coleta geral-purpose não é necessário antes deste contrato seja provado.
 
 ### LayerNorm
 
 ```text
 LayerNorm
-  input Tensor
+  entrada Tensor
   gamma Parameter
   beta Parameter
   epsilon
-  stable normalization over last dimension
+  normalização estável sobre a última dimensão
 ```
 
-Rather than first exposing unrelated public mean, variance, sub, mul, and
-rsqrt operators, NN-4 should begin with a safe reference LayerNorm kernel. It
-computes mean and variance stably over the last dimension, applies epsilon,
-gamma, and beta, preserves leading dimensions, and returns a new Tensor.
-Primitive kernels should be extracted later only when multiple consumers need
-them.
+Em vez de primeiro expor operadores públicos relacionados à média, variância, subtração, multiplicação e
+raiz quadrada inversa, NN-4 deve começar com um kernel de LayerNorm de referência seguro. Ele
+calcula a média e a variância estável sobre a última dimensão, aplica epsilon,
+gamma e beta, preserva as dimensões anteriores e retorna um novo Tensor.
+Primitivos kernels devem ser extraídos mais tarde apenas quando múltiplos consumidores precisarem deles.
 
 ### GELU
 
-NN-5 introduces one explicit Float32 GELU reference kernel and Tensor-handle
-operation. The review must choose and document exact versus tanh approximation
-before implementation; model configuration/weights must use the matching
-variant. GELU is element-wise, immutable, shape-preserving, and requires parity
-against a trusted reference.
+NN-5 apresenta uma única operação explícita Float32 GELU de referência e operações de handle Tensor. A revisão deve escolher e documentar a exata ou a aproximação tanh antes da implementação; a configuração/modelo/pesos devem usar a variante correspondente. GELU é elemento-wise, imutável, preservando a forma e requer paridade contra um referencial confiável.
 
-## Gates
+## Portões
 
 ```text
-NN-R1  architecture review                              COMPLETE
-NN-0   PHP Native Tensor bridge                         PENDING
-NN-1   Parameter + Module introspection contracts       PENDING
-NN-2   Linear with native last-dimension projection     PENDING
-NN-3   Embedding with validated integer lookup          PENDING
-NN-4   stable LayerNorm                                  PENDING
-NN-5   GELU                                              PENDING
-NN-R2  review before Attention                          PENDING
+NN-R1  revisão de arquitetura da rede neural                              COMPLETO
+NN-0   ponte nativa do Tensor no PHP                         PENDENTE
+NN-1   contratos de introspecção e composição para parâmetro e módulo       PENDENTE
+NN-2   Linear com projeção na última dimensão nativa                      PENDENTE
+NN-3   Embedding com pesquisa de token inteiro validada                    PENDENTE
+NN-4   LayerNorm estável                                                   PENDENTE
+NN-5   GELU                                                              PENDENTE
+NN-R2  revisão antes da atenção                                          PENDENTE
 ```
 
-Every implementation gate requires its own approval, tests, and documentation
-update. NN-R2 must review Q/K/V orientation, batch/sequence/head shapes,
-masking, scaling, and softmax axis before any Attention implementation.
+Cada portão de implementação requer sua própria aprovação, testes e atualização de documentação.
+NN-R2 deve revisar a orientação Q/K/V, formas de batch/sequence/head,
+máscaras, escalas e eixo do softmax antes de qualquer implementação de atenção.
 
-## Explicitly deferred
+## Explicitamente adiadas
 
-- training, gradients, autograd, and optimizers;
-- generic broadcasting;
-- generic gather before Embedding proves its requirements;
-- generic reductions solely to assemble LayerNorm;
-- views and non-contiguous Tensors;
-- additional dtypes solely to represent tokenizer output;
-- SIMD, BLAS, GPU, and fused Transformer blocks;
-- attention implementation before NN-R2.
+- treinamento, gradientes, autograd e otimizadores;
+- broadcasting genérico;
+- coleta geral-purpose antes que a Embedding provar suas necessidades;
+- reduções gerais apenas para montar LayerNorm;
+- visualizações e tensores não contínuos;
+- tipos de dados adicionais apenas para representar a saída do tokenizador;
+- SIMD, BLAS, GPU e blocos Transformer fusos;
+- implementação da atenção antes de NN-R2.
 
