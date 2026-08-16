@@ -1,51 +1,47 @@
-# Native Tensor design proposal
+# Design de Tensor Nativo
 
-Status: **T1 through T10 implemented; NN-R1 complete; PHP handle bridge is the next gate**.
+Status: **T1 até T10 implementados; NN-R1 completo; o próximo passo é a ponte do PHP handle**.
 
-The validated buffer APIs established the C ABI, PHP FFI, safe-kernel boundary,
-row-major indexing, dimensional validation, and numerical behavior. They are
-not the final execution model because every call currently copies data between
-PHP arrays and native buffers.
+As APIs de buffer validadas estabeleceram o C ABI, PHP FFI, limite seguro da kernel, indexação em linha única, validação dimensional e comportamento numérico. Eles não são o modelo de execução final porque cada chamada atualmente copia dados entre arrays PHP e buffers nativos.
 
-## Objective
+## Objetivo
 
-Keep tensor data in Rust across operation chains:
+Manter os dados do tensor em Rust ao longo das cadeias de operações:
 
 ```text
-PHP Tensor
+Tensor PHP
     |
-    +-- opaque handle
+    +-- handle opaco
             |
             v
-       Rust Tensor
-            +-- add
-            +-- matmul
-            +-- transpose
+       Tensor Rust
+            +-- adição
+            +-- multiplicação matricial
+            +-- transposição
             +-- softmax
 ```
 
-Only an explicit debugging/materialization operation copies data back to PHP.
+Apenas uma operação explícita de depuração/materialização copia dados de volta para PHP.
 
-## Tensor v1 boundaries
+## Limites do Tensor v1
 
-The first native Tensor is deliberately conservative:
+O primeiro tensor nativo é deliberadamente conservador:
 
-- CPU only;
-- Float32 only;
-- contiguous row-major storage only;
-- Tensor exclusively owns its storage;
-- no views or shared storage;
-- no broadcasting;
-- no implicit dtype conversion;
-- no in-place public operations;
-- operations return newly owned tensors.
+- CPU apenas;
+- Float32 apenas;
+- armazenamento contínuo em linha única apenas;
+- o tensor exclusivamente possui seu armazenamento;
+- sem visualizações ou armazenamento compartilhado;
+- sem broadcasting;
+- sem conversão implícita de tipo de dados;
+- sem operações públicas in-place;
+- as operações retornam novos tensores proprietários.
 
-These restrictions reduce simultaneous uncertainty while leaving clear
-extension points for later milestones.
+Essas restrições reduzem a simultaneidade de incerteza enquanto deixam claros pontos de extensão para futuras marcos.
 
-## Responsibilities
+## Responsabilidades
 
-Conceptually, the model is:
+Conceptualmente, o modelo é:
 
 ```rust
 pub struct Tensor {
@@ -56,90 +52,76 @@ pub struct Tensor {
 }
 ```
 
-This is the committed T3 structure in `runtime/src/tensor/tensor.rs`.
+Isso é a estrutura T3 confirmada em `runtime/src/tensor/tensor.rs`.
 
 ### DType
 
-Describes how storage elements are interpreted. Tensor v1 supports only
-`Float32`, but dtype remains explicit so Tensor does not become permanently
-coupled to one representation.
+Descreve como os elementos de armazenamento são interpretados. Tensor v1 suporta apenas
+`Float32`, mas o tipo de dados permanece explícito para que o tensor não se torne permanentemente
+acoplado a uma representação específica.
 
 ### Shape
 
-Owns an ordered list of dimension sizes. It is responsible for checked element
-count calculation and rejects dimension products that overflow `usize`.
+Detém uma lista ordenada de tamanhos de dimensão. Ele é responsável pela verificação calculada do número de elementos e rejeita produtos de dimensões que estouram `usize`.
 
 ### Strides
 
-Maps logical coordinates to storage offsets. Contiguous row-major strides are
-derived from Shape using checked multiplication.
+Mapeia as coordenadas lógicas para deslocamentos de armazenamento. Os passos contínuos em linha única são derivados da forma usando multiplicação verificada.
 
 ```text
-shape   = [2, 3]
-strides = [3, 1]
+forma   = [2, 3]
+passos = [3, 1]
 
-index [1, 2]
-offset = 1*3 + 2*1 = 5
+índice [1, 2]
+deslocamento = 1*3 + 2*1 = 5
 ```
 
-Tensor v1 stores explicit contiguous strides even though they can be derived.
-This lets invariants and future view semantics evolve without changing the
-Tensor responsibility boundary.
+Tensor v1 armazena explicitamente passos contínuos, mesmo que possam ser derivados. Isso permite que invariants e semânticas de visualização futuras evoluam sem alterar a fronteira de responsabilidade do tensor.
 
-For any zero-sized Shape, T1 uses canonical all-zero strides. No logical index
-is valid for such a Shape, so these strides are never used to access storage;
-the convention also avoids irrelevant stride-product overflow in empty layouts.
+Para qualquer forma com tamanho zero, T1 usa passos canônicos todos-zeros. Nenhum índice lógico é válido para tal forma, então esses passos nunca são usados para acessar o armazenamento; a convenção também evita estouro de produto de deslocamento irrelevante em layouts vazios.
 
-### Storage
+### Armazenamento
 
-Owns the native allocation as a concrete `Vec<f32>` with exclusive ownership.
-Its API is intentionally limited to construction, zero allocation, length,
-safe slice access, and transfer back into a Vec. Storage does not know logical
-shape, strides, dtype, indexing semantics, devices, or mathematical operations.
+Detém a alocação nativa como um `Vec<f32>` concreto com propriedade exclusiva. Sua API é intencionalmente limitada à construção, alocação zero, comprimento, acesso seguro ao fatiamento e transferência de volta em um Vec. O armazenamento não sabe sobre a forma lógica, passos, tipo de dados, semânticas de indexação, dispositivos ou operações matemáticas.
 
 ### Tensor
 
-Combines storage, shape, strides, and dtype and enforces their consistency:
+Combina armazenamento, forma, passos e tipo de dados e garante sua consistência:
 
-- storage length equals Shape element count;
-- strides have the same rank as Shape;
-- strides describe contiguous row-major layout in v1;
-- dtype is Float32;
-- every reachable offset lies inside storage.
+- comprimento do armazenamento igual ao número de elementos da forma;
+- os passos têm a mesma classificação que a forma;
+- os passos descrevem um layout contínuo em linha única na v1;
+- o tipo de dados é Float32;
+- cada offset acessível está dentro do armazenamento.
 
-## Ownership and lifetime
+## Propriedade e tempo de vida
 
-Tensor v1 owns Storage directly. There is no `Arc`, reference counting, shared
-mutable state, or borrowed view across the C ABI.
+Tensor v1 possui diretamente o Armazenamento. Não há `Arc`, contagem de referências, estado mutável compartilhado ou visualização emprestada entre a fronteira C ABI.
 
-Future views may use shared immutable storage such as `Arc<Storage>`, but only
-after creation, destruction, operation results, and PHP lifecycle behavior are
-proven with exclusive ownership.
+Visualizações futuras podem usar armazenamento imutável compartilhado como `Arc<Storage>`, mas apenas após a criação, destruição, resultados das operações e o comportamento do ciclo de vida do PHP serem provados com propriedade exclusiva.
 
-## Transpose policy
+## Política de transposição
 
-The existing buffer `transpose_f32` materializes reordered data and remains the
-reference behavior. Tensor v1 should initially do the same and return a new
-contiguous Tensor.
+A existente função de buffer `transpose_f32` materializa dados reordenados e permanece como o comportamento de referência. Tensor v1 deve inicialmente fazer o mesmo e retornar um novo tensor contínuo.
 
-A future view can transpose without copying by swapping shape and strides:
+Uma visualização futura pode transpor sem copiar trocando forma e passos:
 
 ```text
-before: shape [2, 3], strides [3, 1]
-after:  shape [3, 2], strides [1, 3]
+antes: forma [2, 3], passos [3, 1]
+depois:  forma [3, 2], passos [1, 3]
 ```
 
-That optimization is explicitly outside Tensor v1.
+Essa otimização é explicitamente fora do escopo de Tensor v1.
 
-## Opaque C ABI boundary
+## Fronteira opaca da ABI C
 
-The future ABI should expose an incomplete C type, never a Rust layout:
+O futuro ABI deve expor um tipo incompleto em C, nunca um layout Rust:
 
 ```c
 typedef struct TransformerTensor TransformerTensor;
 ```
 
-Lifecycle functions implemented in T5:
+Funções de ciclo de vida implementadas no T5:
 
 ```c
 int transformer_tensor_create_f32(
@@ -152,16 +134,11 @@ int transformer_tensor_create_f32(
 void transformer_tensor_destroy(TransformerTensor* tensor);
 ```
 
-PHP treats the result as an opaque pointer. Successful creation writes one
-uniquely owned handle to `output`; failure leaves it null and returns a status.
-Exactly one matching destroy releases a non-null handle, while destroy of null
-is a no-op. Double-destroy and use-after-free violate the caller contract. Rust
-panics must be caught before they cross the ABI boundary.
+O PHP trata o resultado como um ponteiro opaco. A criação bem-sucedida escreve um único handle exclusivamente proprietário para `output`; a falha deixa-o nulo e retorna um status. Exatamente uma destruição correspondente libera um handle não-nulo, enquanto destruição de nulo é uma operação nula. Destruição dupla e uso após desalocar violam o contrato do chamador. Panics em Rust devem ser capturados antes de cruzarem a fronteira ABI.
 
-Metadata queries use status codes and caller-owned output buffers. Shape is
-copied rather than exposed through a borrowed pointer into Rust storage.
+Consultas de metadados usam códigos de status e buffers de saída proprietários pelo chamador. A forma é copiada em vez de exposta através de um ponteiro emprestado para o armazenamento Rust.
 
-Future operations return new opaque handles:
+Operações futuras retornam novos handles opacos:
 
 ```c
 TransformerTensor* transformer_tensor_matmul(
@@ -170,20 +147,16 @@ TransformerTensor* transformer_tensor_matmul(
 );
 ```
 
-The concrete error-return mechanism must be designed before implementation;
-returning null alone is insufficient for useful diagnostics.
+O mecanismo de retorno de erro concreto deve ser projetado antes da implementação; retornar apenas nulo é insuficiente para diagnósticos úteis.
 
-## Materialization boundary
+## Fronteira de materialização
 
-Tensor data remains native across operations. T6 provides
-`transformer_tensor_numel` followed by `transformer_tensor_copy_data_f32` for
-debugging, tests, serialization boundaries, and final PHP consumption. Copy-out
-never writes when capacity is insufficient, never exposes internal storage, and
-does not consume the handle.
+Os dados do tensor permanecem nativos em operações. T6 fornece
+`transformer_tensor_numel` seguido por `transformer_tensor_copy_data_f32` para depuração, testes, limites de serialização e consumo final do PHP. A cópia de saída nunca escreve quando a capacidade é insuficiente, nunca expõe o armazenamento interno e não consome o handle.
 
-## Reference APIs and parity
+## APIs opacas e paridade
 
-The current buffer APIs remain available during Tensor development:
+As APIs atuais de buffer permanecem disponíveis durante o desenvolvimento do tensor:
 
 ```text
 transformer_tensor_add_f32
@@ -192,45 +165,38 @@ transformer_transpose_f32
 transformer_softmax_f32
 ```
 
-They are reference implementations for parity:
+Eles são implementações de referência para paridade:
 
 ```text
-validated buffer API ≈ Tensor-handle API
+API de buffer validada ≈ API de handle de tensor
 ```
 
-They must not be optimized away or deleted until Tensor operations have trusted
-parity coverage and the project explicitly retires them.
+Eles não devem ser otimizados embora ou excluídos até que as operações do tensor tenham cobertura de paridade confiável e o projeto explicitamente retirem-os.
 
-## Implementation gates
+## Portões de implementação
 
-Each gate requires its own tests and review before the next begins:
+Cada portão requer seus próprios testes e revisão antes que o próximo comece:
 
-1. **T1 — DType, Shape, Strides:** complete in pure Rust; no FFI.
-2. **T2 — Storage<Float32>:** complete with exclusive `Vec<f32>` ownership.
-3. **T3 — Tensor Rust:** complete as a contiguous Float32 CPU Tensor; no handles.
-4. **T4 — Opaque handle:** complete with a private Rust representation and lifecycle contract.
-5. **T5 — Metadata ABI:** complete with create, destroy, shape, rank, and dtype.
-6. **T6 — Explicit copy-out:** complete with numel query and capacity checks.
-7. **T7 — Tensor add:** complete with buffer `add_f32` parity.
-8. **T8 — Tensor matmul:** complete with naive buffer matmul parity.
-9. **T9 — Tensor transpose:** complete as materialized and contiguous.
-10. **T10 — Tensor softmax:** complete with stable 1D behavior and parity.
+1. **T1 — DType, Shape, Strides:** completo em Rust puro; sem FFI.
+2. **T2 — Storage<Float32>:** completo com propriedade exclusiva de `Vec<f32>`.
+3. **T3 — Tensor Rust:** completo como um tensor contínuo Float32 CPU; sem handles.
+4. **T4 — Handle opaco:** completo com representação privada em Rust e contrato de ciclo de vida.
+5. **T5 — ABI de metadados:** completo com criação, destruição, forma, classificação e tipo de dados.
+6. **T6 — Cópia explícita de saída:** completo com consulta de numel e verificações de capacidade.
+7. **T7 — Adição de tensor:** completo com paridade da função `add_f32` do buffer.
+8. **T8 — Multiplicação matricial de tensor:** completo com paridade da multiplicação matricial básica do buffer.
+9. **T9 — Transposição de tensor:** completo como materializada e contínua.
+10. **T10 — Softmax de tensor:** completo com comportamento estável em 1D e paridade.
 
-After T10, the project pauses Tensor kernel expansion for an NN architecture
-review covering Parameter, Module, Linear, Embedding, LayerNorm, and GELU.
-Views, shared storage, non-contiguous tensors, broadcasting, multiple dtypes,
-and optimized kernels remain deferred until a concrete consumer requires them.
+Após T10, o projeto pausa a expansão dos kernels do tensor para uma revisão da arquitetura NN cobrindo Parameter, Module, Linear, Embedding, LayerNorm e GELU. Visualizações, armazenamento compartilhado, tensores não contínuos, broadcasting, múltiplos tipos de dados e kernels otimizados permanecem adiados até que um consumidor concreto os exija.
 
-## Decisions validated in T5
+## Decisões validadas no T5
 
-Before implementation starts, confirm:
+Antes da implementação começar, confirme:
 
-- status values are OK `0`, invalid argument `1`, panic `2`, and insufficient
-  buffer `3`;
-- shape queries copy into caller storage and return insufficient buffer when
-  capacity is below rank;
-- the stable Float32 dtype discriminant is `0`;
-- create failures leave the output handle null;
-- scalar and zero-sized Tensor creation follow the Rust Shape contracts;
-- exactly-once PHP object destruction and formal ABI versioning remain for
-  later integration work.
+- valores de status OK `0`, argumento inválido `1`, pânico `2` e buffer insuficiente `3`;
+- consultas de forma copiam para o armazenamento do chamador e retornam buffer insuficiente quando a capacidade está abaixo da classificação;
+- o discriminante estável do tipo de dados Float32 é `0`;
+- falhas na criação deixam o handle de saída nulo;
+- criação de escalar e tensores com tamanho zero seguem os contratos de forma em Rust;
+- destruição exclusiva do objeto PHP e versão formal da ABI permanecem para trabalho de integração futura.
