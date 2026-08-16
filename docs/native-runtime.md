@@ -1,54 +1,49 @@
-# Native Rust runtime
+# Runtime Nativo em Rust
 
-The native runtime is a standalone Rust crate under `runtime/`, built by Cargo
-as a `cdylib`. It is not implemented inside the PHP extension.
+O runtime nativo é um crate Rust independente sob `runtime/`, construído pelo Cargo como uma `cdylib`. Ele não está implementado dentro do extensão PHP.
 
 ```text
-PHP library -> FFI -----------------+
-                                      -> stable C ABI -> Rust runtime
-PHP library -> Zend extension ------+
+Biblioteca PHP -> FFI -----------------+
+                                      -> ABI estável de C -> Runtime Rust
+Biblioteca PHP -> Extensão Zend ------+
 ```
 
-PHP never receives Rust strings, vectors, traits, panics, or ownership types.
-The C ABI uses pointers, lengths, primitive values, and integer status codes.
+O PHP nunca recebe strings, vetores, traits, panics ou tipos de propriedade.
+A ABI de C usa ponteiros, comprimentos, valores primitivos e códigos de status inteiros.
 
-## Safety boundary
+## Limite de segurança
 
-Unsafe code is confined to `runtime/src/ffi/mod.rs`, where validated pointers
-are converted into borrowed slices. Kernels such as
-`runtime/src/kernels/add.rs` are safe Rust and accept only slices. Exported
-operations use `catch_unwind` so a panic cannot unwind through the C ABI.
+Código inseguro é confinado a `runtime/src/ffi/mod.rs`, onde ponteiros validados são convertidos em fatias emprestadas. Os kernels como
+`runtime/src/kernels/add.rs` são operações Rust seguras que aceitam apenas fatias. Operações exportadas usam `catch_unwind` para garantir que um panic não possa escapar através da ABI de C.
 
-`catch_unwind` contains Rust panics; it cannot make an invalid pointer safe.
-For every non-empty buffer call, the ABI caller guarantees that:
+`catch_unwind` contém panics em Rust; ele não pode tornar um ponteiro inválido seguro.
+Para cada chamada de buffer não vazio, o chamador da ABI garante que:
 
-- `a` points to at least `length` initialized, readable `f32` elements;
-- `b` points to at least `length` initialized, readable `f32` elements;
-- `output` points to at least `length` writable `f32` elements;
-- all three buffers remain valid for the complete call;
-- `output` does not overlap the input buffers.
+- `a` aponta para pelo menos `length` elementos inicializados e legíveis de `f32`;
+- `b` aponta para pelo menos `length` elementos inicializados e legíveis de `f32`;
+- `output` aponta para pelo menos `length` elementos escritos de `f32`;
+- todos os três buffers permanecem válidos durante a chamada completa;
+- `output` não sobrepõe os buffers de entrada.
 
-The boundary can reject null pointers and impossible lengths, but a non-null
-pointer is not proof that memory is valid. Violating the caller contract may
-cause undefined behavior before Rust can return a status code.
+O limite pode rejeitar ponteiros nulos e comprimentos impossíveis, mas um ponteiro não nulo não prova que a memória é válida. Violar o contrato do chamador pode causar comportamento indefinido antes que Rust possa retornar um código de status.
 
-The addition ABI returns:
+A ABI de adição retorna:
 
 ```text
 0 = OK
-1 = INVALID_ARGUMENT
-2 = PANIC contained at the ABI boundary
+1 = ARGUMENTO INVÁLIDO
+2 = PANIC contido no limite da ABI
 ```
 
-## Opaque Tensor decision
+## Decisão sobre Tensor Opaque
 
 ```text
-PHP Tensor
+Tensor PHP
     |
-    +-- handle / native pointer
+    +-- handle / ponteiro nativo
               |
               v
-         Native Tensor
+         Tensor Nativo
               +-- buffer
               +-- shape
               +-- strides
@@ -56,49 +51,42 @@ PHP Tensor
               +-- device
 ```
 
-Native buffers remain native between operations. `NativeStorage` owns the
-opaque handle on the PHP side, and conversion to a PHP array is explicit via
-`Tensor::toFloat32()`. Rust ownership governs native lifetimes; the C ABI never
-exposes Rust types.
+Buffers nativos permanecem nativos entre operações. `NativeStorage` possui o handle opaco do lado PHP, e a conversão para um array PHP é explícita através de `Tensor::toFloat32()`. A propriedade Rust governa as vidas nativas; a ABI de C nunca expõe tipos Rust.
 
-## Current execution models
+## Modelos atuais de execução
 
-The legacy buffer APIs intentionally perform copies:
+Os APIs legados de buffer intencionalmente realizam cópias:
 
 ```text
-PHP array -> FFI buffer -> Rust kernel -> FFI buffer -> PHP array
+array PHP -> buffer FFI -> kernel Rust -> buffer FFI -> array PHP
 ```
 
-They remain available for compatibility and numerical parity.
+Eles permanecem disponíveis para compatibilidade e paridade numérica.
 
-The production-oriented PHP path uses resident handles:
+O caminho orientado à produção do PHP usa handles residentes:
 
 ```text
-PHP array
-    -> tensorFromFloat32()       one copy-in
-    -> Native Tensor
-    -> matmul/add/softmax/...    no PHP materialization
-    -> Native Tensor
-    -> toFloat32()               explicit copy-out
+array PHP
+    -> tensorFromFloat32()       uma cópia de entrada
+    -> Tensor Nativo
+    -> matmul/add/softmax/...    sem materialização no PHP
+    -> Tensor Nativo
+    -> toFloat32()               cópia explícita de saída
 ```
 
-Every operation returns a new owned handle; inputs remain live and unchanged.
-`destroy()` releases a handle early, while the PHP destructor is the fallback.
+Cada operação retorna um novo handle proprietário; os inputs permanecem vivos e inalterados.
+`destroy()` libera um handle cedo, enquanto o destrutor PHP é a fallback.
 
-The implemented progression is:
+A progressão implementada é:
 
 ```text
 native_version -> add_f32 -> matmul_f32 -> transpose_f32 -> softmax_f32
-    -> stable basic operations
-    -> Native Tensor / Shape / Strides / DType / opaque handles
-    -> PHP Tensor / NativeStorage resident bridge
+    -> operações básicas estáveis
+    -> Tensor Nativo / Shape / Strides / DType / handles opacos
+    -> bridge PHP Tensor / NativeStorage residente
 ```
 
-Future kernels include normalization, attention, activation, cache, and
-quantization. SIMD, BLAS, threads, GPU, and optimized matmul follow correctness,
-parity, and profiling. The naive matmul stays available as the numerical
-reference rather than being replaced by optimized implementations.
+Futuros kernels incluem normalização, atenção, ativação, cache e quantização. SIMD, BLAS, threads, GPU e matmul otimizado seguem a corretude, paridade e perfilamento. O matmul naive permanece disponível como referência numérica em vez de ser substituído por implementações otimizadas.
 
-The 1D softmax reference remains available and numerically stable. The additive
-`transformer_tensor_softmax_last_dim` operation supports contiguous rank-N
-Tensors and normalizes every row along the last axis in one native call.
+O 1D softmax de referência permanece disponível e está numericamente estável. A operação aditiva `transformer_tensor_softmax_last_dim` suporta tensores contínuos de rank-N
+e normaliza cada linha ao longo do último eixo em uma única chamada nativa.
