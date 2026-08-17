@@ -1,6 +1,8 @@
 pub mod add;
+pub mod attention;
 mod blas;
 pub mod embedding;
+pub mod gelu;
 pub mod layer_norm;
 pub mod linear;
 pub mod matmul;

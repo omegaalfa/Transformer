@@ -322,13 +322,14 @@ FASE NN
   NN-2   Linear                               ✅ concluída
   NN-3   Embedding                            ✅ concluída
   NN-4   LayerNorm                            ✅ concluída
-  NN-5   GELU                                 ⬜
-  NN-R2  revisão antes de Attention           ⬜
+  NN-5   GELU tanh                            ✅ concluída
+  NN-R2  revisão antes de Attention           ✅ concluída
+  NN-6   MultiHeadAttention não causal        ✅ concluída
 
 FASE TRANSFORMER
-  Q / K / V                                   ⬜
-  Self-Attention                              ⬜
-  Multi-Head Attention                        ⬜
+  Q / K / V                                   ✅ concluída
+  Self-Attention                              ✅ concluída via MultiHeadAttention
+  Multi-Head Attention                        ✅ concluída
   Feed Forward                                ⬜
   Residual + TransformerBlock                 ⬜
 
@@ -371,6 +372,22 @@ O módulo `LayerNorm` executa normalização de inferência sobre a última
 dimensão por meio do backend FFI, com gamma/beta residentes e `epsilon=1e-5`
 por default. O kernel usa Welford/Float64, produz um Tensor independente e
 rejeita shapes, epsilon ou valores não finitos antes de publicar o output.
+
+## GELU nativo (NN-5)
+
+`Gelu` implementa a aproximação tanh canônica sobre Tensors Float32 residentes,
+com cálculo interno Float64. A operação preserva qualquer shape, aceita escalar
+e Tensor vazio, rejeita NaN/Inf e retorna Storage independente. O módulo é
+stateless e não possui parâmetros.
+
+## MultiHeadAttention nativa (NN-6)
+
+`MultiHeadAttention` executa self-attention não causal sobre `[B,S,D]` com
+quatro projeções `Linear(D,D)` residentes e sem bias. A máscara opcional é um
+value object booleano `[B,S]`: `true` permite uma key e `false` a exclui do
+softmax estável. A operação dedicada permanece totalmente nativa, retorna um
+Tensor `[B,S,D]` independente e não adiciona reshape, permute, Tensor booleano,
+RoPE, KV cache, dropout, GPU ou integração ao Graph Executor.
 
 ## Licença
 

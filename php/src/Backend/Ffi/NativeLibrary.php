@@ -10,6 +10,7 @@ use Omegaalfa\Transformer\Exception\BackendException;
 use Omegaalfa\Transformer\Tensor\Shape;
 use Omegaalfa\Transformer\Tensor\Storage\NativeStorage;
 use Omegaalfa\Transformer\Tensor\Tensor;
+use Omegaalfa\Transformer\Transformer\AttentionMask;
 
 final readonly class NativeLibrary
 {
@@ -98,6 +99,49 @@ final readonly class NativeLibrary
 
         [$batch, $sequence] = $shape->dimensions;
         $outputStorage = $storage->embeddingTokenIds($tokenIds, $batch, $sequence, $this->ffi);
+
+        return new Tensor($outputStorage->shape(), $outputStorage);
+    }
+
+    public function gelu(Tensor $input): Tensor
+    {
+        $storage = $input->storage();
+        if (!$storage instanceof NativeStorage) {
+            throw new \LogicException('GELU requires native storage.');
+        }
+
+        $outputStorage = $storage->gelu($this->ffi);
+
+        return new Tensor($outputStorage->shape(), $outputStorage);
+    }
+
+    public function multiHeadAttention(
+        Tensor $input,
+        Tensor $qWeight,
+        Tensor $kWeight,
+        Tensor $vWeight,
+        Tensor $outWeight,
+        int $heads,
+        ?AttentionMask $mask = null,
+    ): Tensor {
+        $storages = [];
+        foreach ([$input, $qWeight, $kWeight, $vWeight, $outWeight] as $tensor) {
+            $storage = $tensor->storage();
+            if (!$storage instanceof NativeStorage) {
+                throw new \LogicException('Multi-head attention requires native storage.');
+            }
+            $storages[] = $storage;
+        }
+        [$inputStorage, $qStorage, $kStorage, $vStorage, $outStorage] = $storages;
+        $outputStorage = $inputStorage->multiHeadAttention(
+            $qStorage,
+            $kStorage,
+            $vStorage,
+            $outStorage,
+            $heads,
+            $mask,
+            $this->ffi,
+        );
 
         return new Tensor($outputStorage->shape(), $outputStorage);
     }

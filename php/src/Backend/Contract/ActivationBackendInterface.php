@@ -8,5 +8,7 @@ use Omegaalfa\Transformer\Tensor\Tensor;
 
 interface ActivationBackendInterface
 {
+    public function gelu(Tensor $input): Tensor;
+
     public function softmax(Tensor $tensor, int $axis = -1): Tensor;
 }

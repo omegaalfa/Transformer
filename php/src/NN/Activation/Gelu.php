@@ -4,11 +4,15 @@ declare(strict_types=1);
 
 namespace Omegaalfa\Transformer\NN\Activation;
 
-use LogicException;
+use Omegaalfa\Transformer\Runtime\Runtime;
 use Omegaalfa\Transformer\Tensor\Tensor;
 
-final class Gelu implements ActivationInterface
+final readonly class Gelu implements ActivationInterface
 {
+    public function __construct(public Runtime $runtime)
+    {
+    }
+
     public function parameters(): array
     {
         return [];
@@ -21,6 +25,6 @@ final class Gelu implements ActivationInterface
 
     public function forward(Tensor $input): Tensor
     {
-        throw new LogicException('GELU is not implemented yet.');
+        return $this->runtime->backend()->gelu($input);
     }
 }

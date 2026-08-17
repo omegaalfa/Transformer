@@ -12,6 +12,7 @@ use Omegaalfa\Transformer\Tensor\Buffer\Float32Buffer;
 use Omegaalfa\Transformer\Tensor\DType;
 use Omegaalfa\Transformer\Tensor\Device;
 use Omegaalfa\Transformer\Tensor\Shape;
+use Omegaalfa\Transformer\Transformer\AttentionMask;
 
 final class NativeStorage implements StorageInterface
 {
@@ -234,6 +235,59 @@ final class NativeStorage implements StorageInterface
     public function softmax(): self
     {
         return $this->unary('transformer_tensor_softmax');
+    }
+
+    public function gelu(FFI $runtimeFfi): self
+    {
+        if ($this->ffi !== $runtimeFfi) {
+            throw new LogicException('Native tensor belongs to a different runtime instance.');
+        }
+
+        return $this->unary('transformer_tensor_gelu');
+    }
+
+    public function multiHeadAttention(
+        self $qWeight,
+        self $kWeight,
+        self $vWeight,
+        self $outWeight,
+        int $heads,
+        ?AttentionMask $mask,
+        FFI $runtimeFfi,
+    ): self {
+        foreach ([$qWeight, $kWeight, $vWeight, $outWeight] as $weight) {
+            if ($this->ffi !== $weight->ffi || $this->ffi !== $runtimeFfi) {
+                throw new LogicException('Native tensors belong to different runtime instances.');
+            }
+        }
+        $maskBuffer = null;
+        $maskLength = 0;
+        if ($mask !== null) {
+            $maskLength = count($mask->values);
+            $maskBuffer = $this->ffi->new('uint8_t[' . max(1, $maskLength) . ']');
+            foreach ($mask->values as $index => $value) {
+                // @phpstan-ignore offsetAccess.nonOffsetAccessible (FFI C array.)
+                $maskBuffer[$index] = $value ? 1 : 0;
+            }
+        }
+        $output = $this->ffi->new('TransformerTensor *[1]');
+        $this->requireStatus(
+            // @phpstan-ignore method.notFound (Native methods are defined by FFI::cdef().)
+            $this->ffi->transformer_tensor_multi_head_attention(
+                $this->handle(),
+                $qWeight->handle(),
+                $kWeight->handle(),
+                $vWeight->handle(),
+                $outWeight->handle(),
+                $heads,
+                $maskBuffer,
+                $maskLength,
+                $output,
+            ),
+            'transformer_tensor_multi_head_attention',
+        );
+
+        return new self($this->ffi, $output[0]);
     }
 
     public function softmaxLastDim(): self

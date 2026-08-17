@@ -9,6 +9,7 @@ use Omegaalfa\Transformer\Backend\AbstractBackend;
 use Omegaalfa\Transformer\Backend\BackendType;
 use Omegaalfa\Transformer\Tensor\Shape;
 use Omegaalfa\Transformer\Tensor\Tensor;
+use Omegaalfa\Transformer\Transformer\AttentionMask;
 
 final class FfiBackend extends AbstractBackend
 {
@@ -94,6 +95,31 @@ final class FfiBackend extends AbstractBackend
     public function softmax(Tensor $tensor, int $axis = -1): Tensor
     {
         return $tensor->softmax($axis);
+    }
+
+    public function gelu(Tensor $input): Tensor
+    {
+        return $this->nativeLibrary->gelu($input);
+    }
+
+    public function multiHeadAttention(
+        Tensor $input,
+        Tensor $qWeight,
+        Tensor $kWeight,
+        Tensor $vWeight,
+        Tensor $outWeight,
+        int $heads,
+        ?AttentionMask $mask = null,
+    ): Tensor {
+        return $this->nativeLibrary->multiHeadAttention(
+            $input,
+            $qWeight,
+            $kWeight,
+            $vWeight,
+            $outWeight,
+            $heads,
+            $mask,
+        );
     }
 
     public function transpose(Tensor $tensor, ?int $axisA = null, ?int $axisB = null): Tensor

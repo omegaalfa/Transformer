@@ -1,6 +1,6 @@
 # Revisão da Arquitetura de Redes Neurais (NN-R1)
 
-Status: **NN-1, NN-2, NN-3 e NN-4 implementados; componentes posteriores permanecem pendentes**.
+Status: **NN-1 a NN-5 implementados; componentes posteriores permanecem pendentes**.
 
 A fase Tensor T1–T10 prova a propriedade nativa, ciclo de vida, metadados,
 materialização e execução ponte-a-ponte para adição, multiplicação matricial, transposição e
@@ -173,7 +173,18 @@ Primitivos kernels devem ser extraídos mais tarde apenas quando múltiplos cons
 
 ### GELU
 
-NN-5 apresenta uma única operação explícita Float32 GELU de referência e operações de handle Tensor. A revisão deve escolher e documentar a exata ou a aproximação tanh antes da implementação; a configuração/modelo/pesos devem usar a variante correspondente. GELU é elemento-wise, imutável, preservando a forma e requer paridade contra um referencial confiável.
+NN-5 implementa exclusivamente a aproximação tanh canônica:
+
+```text
+0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+```
+
+Input e output usam Storage Float32; cada elemento é convertido para Float64,
+calculado integralmente nessa precisão, validado e convertido uma vez para
+Float32. GELU é elementwise, stateless, não possui Parameter e preserva
+exatamente qualquer shape, incluindo rank zero e Tensors vazios. NaN, +Inf,
+-Inf e resultados não finitos são rejeitados antes da publicação do output.
+Paridade com a referência PHP double usa `atol=1e-6` e `rtol=1e-6`.
 
 ## Portões
 
@@ -183,9 +194,10 @@ NN-0   ponte nativa do Tensor no PHP                                  COMPLETO
 NN-1   contratos de introspecção e composição para parâmetro e módulo       COMPLETO
 NN-2   Linear com projeção na última dimensão nativa                      COMPLETO
 NN-3   Embedding com pesquisa de token inteiro validada                    COMPLETO
-NN-4   LayerNorm estável                                                   PENDENTE
-NN-5   GELU                                                              PENDENTE
-NN-R2  revisão antes da atenção                                          PENDENTE
+NN-4   LayerNorm estável                                                   COMPLETO
+NN-5   GELU tanh                                                          COMPLETO
+NN-R2  revisão antes da atenção                                          COMPLETO
+NN-6   MultiHeadAttention não causal                                     COMPLETO
 ```
 
 Cada portão de implementação requer sua própria aprovação, testes e atualização de documentação.
@@ -201,7 +213,8 @@ máscaras, escalas e eixo do softmax antes de qualquer implementação de atenç
 - visualizações e tensores não contínuos;
 - tipos de dados adicionais apenas para representar a saída do tokenizador;
 - SIMD, BLAS, GPU e blocos Transformer fusos;
-- implementação da atenção antes de NN-R2.
+- causal Attention, KV cache, RoPE e positional encoding;
+- FeedForward e TransformerBlock antes de seus próprios gates.
 
 ## GPU Readiness
 
@@ -235,3 +248,34 @@ default e deve continuar positivo e finito após conversão para Float32.
 Rank zero, `D=0`, shapes incompatíveis e qualquer NaN/Inf são rejeitados.
 Dimensões externas vazias são válidas quando `D>0` e preservam exatamente o
 shape. Gamma, beta e input permanecem imutáveis; falhas não publicam output.
+
+## NN-6 — MultiHeadAttention de inferência
+
+`MultiHeadAttention` é um `Module`, não um `TensorModule`, porque sua operação
+aceita uma `AttentionMask` opcional além do input. O módulo possui quatro
+`Linear(D,D)` sem bias e residentes, expostos em ordem determinística por
+`modules()` como `q_proj`, `k_proj`, `v_proj` e `out_proj`. A navegação produz
+os nomes qualificados `q_proj.weight`, `k_proj.weight`, `v_proj.weight` e
+`out_proj.weight`; o módulo não duplica esses Parameters em `parameters()`.
+
+O input e o output têm shape `[B,S,D]`, somente rank 3. `H>0`, `D>0` e
+`D % H == 0`; `Dh=D/H`. O runtime projeta Q/K/V, organiza-os logicamente como
+`[B,H,S,Dh]`, calcula scores `[B,H,S,S]`, aplica a escala Float32 obtida de
+`1/sqrt(Float64(Dh))`, normaliza no último eixo, combina V, recompõe
+`[B,S,D]` e aplica `out_proj`. Todas as transformações permanecem internas à
+operação dedicada; Tensor não ganhou reshape, permute, views ou batched matmul.
+
+`AttentionMask` é um value object PHP com `list<bool>` row-major e Shape
+`[B,S]`. `true` permite a key e `false` a exclui da normalização. Não existe
+broadcasting, máscara por head, representação Float32, causalidade ou `-Inf`.
+Um batch sem nenhuma key válida é erro. A bridge converte a máscara apenas
+durante a chamada para `uint8_t`, onde 0/1 preservam a mesma semântica.
+
+`[B,0,D]`, `[0,S,D]` e `[0,0,D]` retornam output vazio idêntico sem executar
+projeções ou reduções. Input, weights, intermediários e output não finitos são
+rejeitados sem publicação parcial. Inputs, máscara e weights são emprestados;
+o output possui Storage independente e nenhum estado de execução permanece no
+módulo. A referência PHP usa doubles; no caso controlado com e sem máscara, os
+máximos observados foram `1.034e-7` absoluto e `9.528e-7` relativo. O gate usa
+`atol=1e-5` e `rtol=1e-5`, conservadores para os casos cobertos e sem promessa
+de paridade bitwise.

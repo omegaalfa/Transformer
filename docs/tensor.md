@@ -27,6 +27,7 @@ quantidade de elementos corresponde ao shape. Essa é uma cópia PHP → Rust.
 - `matmul($other)`: duas matrizes rank-2 compatíveis;
 - `transpose()`: transposição materializada rank-2;
 - `softmax()`: último eixo de Tensor rank ≥ 1.
+- GELU tanh via `Gelu::forward()`: elementwise, shape-preserving e sem parâmetros.
 
 Todas são imutáveis: preservam os inputs e retornam um novo Tensor proprietário.
 É possível encadear operações sem criar arrays intermediários:

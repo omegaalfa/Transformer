@@ -41,7 +41,7 @@ production dispatcher for benchmarked Transformer shapes.
 - [x] Native Shape, strides, dtype, and storage.
 - [x] Rank-N softmax over the last dimension.
 - [x] Resident PHP Tensor/NativeStorage bridge.
-- [ ] Linear, Embedding, LayerNorm, and Attention execution.
+- [x] Linear, Embedding, LayerNorm, GELU, and non-causal MultiHeadAttention execution.
 
 The initial `matmul_f32` must be a straightforward safe reference kernel. SIMD,
 Rayon, BLAS, GPU execution, and other optimizations come only after known-output
@@ -82,7 +82,8 @@ The NN architecture review is complete and did not add numerical code:
 - [x] **NN-2** — Linear with native last-dimension projection and bias.
 - [x] **NN-3** — Embedding with validated integer lookup.
 - [x] **NN-4** — stable inference LayerNorm with resident gamma/beta.
-- [ ] **NN-5** — documented GELU variant and native operation.
-- [ ] **NN-R2** — architecture review before Attention.
+- [x] **NN-5** — Float32 tanh GELU with Float64 internal calculation.
+- [x] **NN-R2** — architecture review before Attention.
+- [x] **NN-6** — non-causal MultiHeadAttention with boolean padding mask.
 
 See [`nn-design.md`](nn-design.md) for the decisions and deferred scope.

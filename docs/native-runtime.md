@@ -179,3 +179,31 @@ operação exige input rank-N com `N>=1`, última dimensão `D>0`, weight/bias
 rank-1 `[D]`, Float32 contíguo row-major e valores finitos. Panics são contidos
 na fronteira C. Shapes como `[0,D]`, `[B,0,D]` e `[0,0,D]` retornam Tensors
 vazios do mesmo shape sem executar Welford.
+
+## GELU Tensor ABI
+
+O símbolo aditivo `transformer_tensor_gelu(input, output)` aplica a aproximação
+tanh GELU elemento a elemento. O input é emprestado e imutável; o output é um
+novo Tensor Float32 contíguo, row-major e com shape idêntico. O cálculo usa
+temporários Float64, rejeita NaN/Inf e só publica o handle após validar toda a
+execução. Rank zero e qualquer shape vazio são válidos. O módulo PHP é
+stateless, não possui Parameters e rejeita inputs de outra `NativeLibrary`.
+
+## MultiHeadAttention Tensor ABI
+
+O símbolo aditivo `transformer_tensor_multi_head_attention` recebe input
+`[B,S,D]`, quatro weights residentes `[D,D]`, `H` e uma máscara booleana
+opcional. Ausência de máscara é `NULL + 0`; uma máscara presente atravessa a
+FFI como `uint8_t[B*S]`, aceitando somente 0/1. O buffer é temporário e continua
+fora do sistema de dtype do Tensor.
+
+O runtime valida rank 3, shapes, Float32 contíguo row-major, `D>0`, `H>0`,
+divisibilidade, overflow, máscara e finitude. Os heads usam layout lógico
+`[B,H,S,Dh]`; scores e probabilidades usam `[B,H,S,S]`. Uma máscara false
+exclui a key do softmax e um batch totalmente mascarado falha. Shapes com
+`B=0` ou `S=0` retornam Tensor vazio sem executar kernels numéricos.
+
+Todos os handles de entrada são imutáveis e emprestados. O output começa nulo,
+é publicado somente depois da execução completa e possui Storage independente.
+Panics retornam status de panic e não atravessam a ABI. A operação permanece
+CPU/Float32 e não se conecta ao Graph Executor experimental.

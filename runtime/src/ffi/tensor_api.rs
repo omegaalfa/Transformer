@@ -3,7 +3,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use crate::kernels::add::add_f32;
+use crate::kernels::attention::multi_head_attention_f32;
 use crate::kernels::embedding::embedding_f32;
+use crate::kernels::gelu::gelu_f32;
 use crate::kernels::layer_norm::layer_norm_f32;
 use crate::kernels::linear::linear_last_dim_f32;
 use crate::kernels::matmul_dispatch::matmul_dispatch_f32;
@@ -19,6 +21,8 @@ const DTYPE_FLOAT32: c_int = 0;
 #[cfg(test)]
 thread_local! {
     static PANIC_LAYER_NORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PANIC_GELU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PANIC_ATTENTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Creates an exclusively owned native Float32 Tensor.
@@ -618,6 +622,53 @@ pub unsafe extern "C" fn transformer_tensor_layer_norm(
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Applies the canonical tanh GELU elementwise into a new owned Tensor.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_tensor_gelu(
+    input: *const TransformerTensor,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: `output` is non-null and writable by the caller contract.
+    unsafe { output.write(ptr::null_mut()) };
+    if input.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        PANIC_GELU.with(|flag| {
+            if flag.replace(false) {
+                panic!("controlled GELU ABI panic");
+            }
+        });
+        // SAFETY: The caller guarantees a live immutable handle.
+        let input = unsafe { &*input }.tensor();
+        if input.dtype() != DType::Float32
+            || input.strides() != &Strides::contiguous(input.shape())
+            || input.as_slice().len() != input.numel()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let shape = input.shape().clone();
+        let mut values = vec![0.0; input.numel()];
+        if gelu_f32(input.as_slice(), &mut values).is_err() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Ok(tensor) = Tensor::from_vec(values, shape) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
+        // SAFETY: Publication happens once, only after successful execution.
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
 /// Materializes the transpose of a rank-2 Float32 Tensor.
 ///
 /// # Safety
@@ -774,6 +825,122 @@ pub unsafe extern "C" fn transformer_tensor_softmax_last_dim(
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Computes non-causal multi-head self-attention into a new owned Tensor.
+///
+/// # Safety
+///
+/// Tensor pointers must identify live immutable handles for the complete call.
+/// A non-null mask must be readable for `mask_length` bytes. `output` must be
+/// writable for one handle pointer and must not alias any input pointer.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn transformer_tensor_multi_head_attention(
+    input: *const TransformerTensor,
+    q_weight: *const TransformerTensor,
+    k_weight: *const TransformerTensor,
+    v_weight: *const TransformerTensor,
+    out_weight: *const TransformerTensor,
+    heads: usize,
+    mask: *const u8,
+    mask_length: usize,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: `output` is non-null and writable by the caller contract.
+    unsafe { output.write(ptr::null_mut()) };
+    if input.is_null()
+        || q_weight.is_null()
+        || k_weight.is_null()
+        || v_weight.is_null()
+        || out_weight.is_null()
+        || (mask.is_null() && mask_length != 0)
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        PANIC_ATTENTION.with(|flag| {
+            if flag.replace(false) {
+                panic!("injected attention panic");
+            }
+        });
+
+        // SAFETY: Required pointers were checked and are live by caller contract.
+        let input = unsafe { &*input }.tensor();
+        let q_weight = unsafe { &*q_weight }.tensor();
+        let k_weight = unsafe { &*k_weight }.tensor();
+        let v_weight = unsafe { &*v_weight }.tensor();
+        let out_weight = unsafe { &*out_weight }.tensor();
+        let weights = [q_weight, k_weight, v_weight, out_weight];
+        if input.dtype() != DType::Float32
+            || input.rank() != 3
+            || input.strides() != &Strides::contiguous(input.shape())
+            || weights.iter().any(|weight| {
+                weight.dtype() != DType::Float32
+                    || weight.rank() != 2
+                    || weight.strides() != &Strides::contiguous(weight.shape())
+            })
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let input_shape = input.shape().as_slice();
+        let (batch, sequence, dimensions) = (input_shape[0], input_shape[1], input_shape[2]);
+        if dimensions == 0
+            || heads == 0
+            || dimensions % heads != 0
+            || weights
+                .iter()
+                .any(|weight| weight.shape().as_slice() != [dimensions, dimensions])
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(expected_mask_length) = batch.checked_mul(sequence) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let mask = if mask.is_null() {
+            None
+        } else {
+            if mask_length != expected_mask_length
+                || mask_length > isize::MAX as usize / size_of::<u8>()
+            {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            // SAFETY: Non-null pointer and representable exact length were validated.
+            Some(unsafe { std::slice::from_raw_parts(mask, mask_length) })
+        };
+
+        let mut values = vec![0.0; input.numel()];
+        if multi_head_attention_f32(
+            input.as_slice(),
+            q_weight.as_slice(),
+            k_weight.as_slice(),
+            v_weight.as_slice(),
+            out_weight.as_slice(),
+            mask,
+            &mut values,
+            batch,
+            sequence,
+            dimensions,
+            heads,
+        )
+        .is_err()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Ok(tensor) = Tensor::from_vec(values, input.shape().clone()) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
+        // SAFETY: `output` is writable and published once after complete success.
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ptr::{null, null_mut};
@@ -804,6 +971,136 @@ mod tests {
             STATUS_OK
         );
         handle
+    }
+
+    #[test]
+    fn tensor_attention_executes_masks_and_preserves_inputs() {
+        // SAFETY: Handles and mask remain live for the calls and are destroyed once.
+        unsafe {
+            let input = create(&[1.0, 0.0, 0.0, 1.0], &[1, 2, 2]);
+            let identity = [1.0, 0.0, 0.0, 1.0];
+            let q = create(&identity, &[2, 2]);
+            let k = create(&identity, &[2, 2]);
+            let v = create(&identity, &[2, 2]);
+            let out = create(&identity, &[2, 2]);
+            let mask = [1u8, 0];
+            let mut output = null_mut();
+            assert_eq!(
+                transformer_tensor_multi_head_attention(
+                    input,
+                    q,
+                    k,
+                    v,
+                    out,
+                    1,
+                    mask.as_ptr(),
+                    mask.len(),
+                    &mut output,
+                ),
+                STATUS_OK
+            );
+            assert_eq!((*output).tensor().shape().as_slice(), &[1, 2, 2]);
+            assert_eq!((*output).tensor().as_slice(), &[1.0, 0.0, 1.0, 0.0]);
+            assert_eq!((*input).tensor().as_slice(), &[1.0, 0.0, 0.0, 1.0]);
+            assert_eq!((*q).tensor().as_slice(), identity);
+            for handle in [input, q, k, v, out, output] {
+                destroy(handle);
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_attention_rejects_invalid_mask_without_publication_and_supports_empty() {
+        // SAFETY: Handles and buffers remain live and are destroyed once.
+        unsafe {
+            let identity = [1.0, 0.0, 0.0, 1.0];
+            let input = create(&[1.0, 2.0], &[1, 1, 2]);
+            let empty = create(&[], &[1, 0, 2]);
+            let q = create(&identity, &[2, 2]);
+            let k = create(&identity, &[2, 2]);
+            let v = create(&identity, &[2, 2]);
+            let out = create(&identity, &[2, 2]);
+            let invalid = [2u8];
+            let mut output = 1usize as *mut TransformerTensor;
+            assert_eq!(
+                transformer_tensor_multi_head_attention(
+                    input,
+                    q,
+                    k,
+                    v,
+                    out,
+                    1,
+                    invalid.as_ptr(),
+                    invalid.len(),
+                    &mut output,
+                ),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert!(output.is_null());
+            let empty_mask: [u8; 0] = [];
+            assert_eq!(
+                transformer_tensor_multi_head_attention(
+                    empty,
+                    q,
+                    k,
+                    v,
+                    out,
+                    1,
+                    empty_mask.as_ptr(),
+                    0,
+                    &mut output,
+                ),
+                STATUS_OK
+            );
+            assert_eq!((*output).tensor().shape().as_slice(), &[1, 0, 2]);
+            destroy(output);
+            for handle in [input, empty, q, k, v, out] {
+                destroy(handle);
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_attention_contains_panic_and_recovers() {
+        // SAFETY: Handles remain live and are destroyed exactly once.
+        unsafe {
+            let input = create(&[1.0], &[1, 1, 1]);
+            let weight = create(&[1.0], &[1, 1]);
+            let mut output = null_mut();
+            PANIC_ATTENTION.with(|flag| flag.set(true));
+            assert_eq!(
+                transformer_tensor_multi_head_attention(
+                    input,
+                    weight,
+                    weight,
+                    weight,
+                    weight,
+                    1,
+                    null(),
+                    0,
+                    &mut output,
+                ),
+                STATUS_PANIC
+            );
+            assert!(output.is_null());
+            assert_eq!(
+                transformer_tensor_multi_head_attention(
+                    input,
+                    weight,
+                    weight,
+                    weight,
+                    weight,
+                    1,
+                    null(),
+                    0,
+                    &mut output,
+                ),
+                STATUS_OK
+            );
+            destroy(output);
+            destroy(input);
+            destroy(weight);
+        }
     }
 
     #[test]
@@ -2216,5 +2513,75 @@ mod tests {
         for handle in [input, weight, bias, output] {
             unsafe { destroy(handle) };
         }
+    }
+
+    #[test]
+    fn tensor_gelu_preserves_scalar_rank_n_empty_shape_and_input() {
+        for (data, shape) in [
+            (&[1.0][..], &[][..]),
+            (&[-1.0, 0.0, 1.0], &[3][..]),
+            (&[-2.0, -1.0, 0.0, 1.0, 2.0, 3.0], &[1, 2, 1, 3][..]),
+            (&[][..], &[2, 0, 3][..]),
+        ] {
+            let input = unsafe { create(data, shape) };
+            let before = unsafe { &*input }.tensor().as_slice().to_vec();
+            let mut output = null_mut();
+            assert_eq!(
+                unsafe { transformer_tensor_gelu(input, &mut output) },
+                STATUS_OK
+            );
+            assert_eq!(unsafe { &*output }.tensor().shape().as_slice(), shape);
+            assert_eq!(unsafe { &*input }.tensor().as_slice(), before);
+            assert_ne!(input, output);
+            for handle in [input, output] {
+                unsafe { destroy(handle) };
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_gelu_rejects_non_finite_without_publication_and_recovers() {
+        let invalid = unsafe { create(&[1.0, f32::NAN], &[2]) };
+        let valid = unsafe { create(&[-1.0, 1.0], &[2]) };
+        let mut output = std::ptr::NonNull::<TransformerTensor>::dangling().as_ptr();
+        assert_eq!(
+            unsafe { transformer_tensor_gelu(invalid, &mut output) },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert!(output.is_null());
+        assert_eq!(
+            unsafe { transformer_tensor_gelu(valid, &mut output) },
+            STATUS_OK
+        );
+        for handle in [invalid, valid, output] {
+            unsafe { destroy(handle) };
+        }
+    }
+
+    #[test]
+    fn tensor_gelu_contains_panic_and_rejects_null_arguments() {
+        let input = unsafe { create(&[1.0], &[1]) };
+        let mut output = std::ptr::NonNull::<TransformerTensor>::dangling().as_ptr();
+        PANIC_GELU.with(|flag| flag.set(true));
+        assert_eq!(
+            unsafe { transformer_tensor_gelu(input, &mut output) },
+            STATUS_PANIC
+        );
+        assert!(output.is_null());
+        assert_eq!(
+            unsafe { transformer_tensor_gelu(input, &mut output) },
+            STATUS_OK
+        );
+        unsafe { destroy(output) };
+        assert_eq!(
+            unsafe { transformer_tensor_gelu(null(), &mut output) },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert!(output.is_null());
+        assert_eq!(
+            unsafe { transformer_tensor_gelu(input, null_mut()) },
+            STATUS_INVALID_ARGUMENT
+        );
+        unsafe { destroy(input) };
     }
 }

@@ -7,6 +7,7 @@ namespace Omegaalfa\Transformer\Backend;
 use LogicException;
 use Omegaalfa\Transformer\Tensor\Shape;
 use Omegaalfa\Transformer\Tensor\Tensor;
+use Omegaalfa\Transformer\Transformer\AttentionMask;
 
 abstract class AbstractBackend implements BackendInterface
 {
@@ -53,6 +54,21 @@ abstract class AbstractBackend implements BackendInterface
     public function softmax(Tensor $tensor, int $axis = -1): Tensor
     {
         throw $this->notImplemented('softmax');
+    }
+    public function gelu(Tensor $input): Tensor
+    {
+        throw $this->notImplemented('gelu');
+    }
+    public function multiHeadAttention(
+        Tensor $input,
+        Tensor $qWeight,
+        Tensor $kWeight,
+        Tensor $vWeight,
+        Tensor $outWeight,
+        int $heads,
+        ?AttentionMask $mask = null,
+    ): Tensor {
+        throw $this->notImplemented('multiHeadAttention');
     }
 
     private function notImplemented(string $operation): LogicException

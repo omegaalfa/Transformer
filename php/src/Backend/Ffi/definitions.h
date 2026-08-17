@@ -66,6 +66,23 @@ int transformer_tensor_layer_norm(
     TransformerTensor** output
 );
 
+int transformer_tensor_gelu(
+    const TransformerTensor* input,
+    TransformerTensor** output
+);
+
+int transformer_tensor_multi_head_attention(
+    const TransformerTensor* input,
+    const TransformerTensor* q_weight,
+    const TransformerTensor* k_weight,
+    const TransformerTensor* v_weight,
+    const TransformerTensor* out_weight,
+    size_t heads,
+    const uint8_t* mask,
+    size_t mask_length,
+    TransformerTensor** output
+);
+
 int transformer_tensor_embedding(
     const int64_t* token_ids,
     size_t batch,
