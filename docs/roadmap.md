@@ -5,7 +5,9 @@
 - [x] **Milestone C foundation** — Rust runtime and first kernel through FFI.
 - [ ] **Milestone D** — softmax, normalization, and attention in Rust.
 - [ ] **Milestone E** — Zend extension consuming the Rust C ABI.
-- [ ] **Milestone F** — real encoder and Safetensors.
+- [ ] **Milestone F** — real encoder and Safetensors (validated metadata,
+  selective payload reading, Float32 materialization and closed Parameter
+  manifests complete; BERT config/model construction pending).
 - [ ] **Milestone G** — ContextEngine integration.
 - [ ] **Milestone H** — CPU optimization after profiling (tiled matmul and optional BLAS complete; SIMD and threads pending).
 - [ ] **Milestone I** — decoder and KV cache.
@@ -88,4 +90,16 @@ The NN architecture review is complete and did not add numerical code:
 - [x] **NN-R3** — architecture review before TransformerBlock.
 - [x] **NN-7** — resident FeedForward and Pre-Norm TransformerBlock composition.
 
+The model-loading foundation is also staged independently:
+
+- [x] **MODEL-R2A** — validated Safetensors header and tensor descriptors.
+- [x] **MODEL-R2B** — selective exact-byte tensor payload reading.
+- [x] **MODEL-R2C** — strict Float32 Tensor materialization and documented
+  PyTorch Linear transposition.
+- [x] **MODEL-R2D** — closed manifest mapping to resident Parameters.
+- [ ] **MODEL-R2E** — config validation and atomic BERT-compatible model
+  construction.
+
 See [`nn-design.md`](nn-design.md) for the decisions and deferred scope.
+See [`model-loading.md`](model-loading.md) for the loader contracts and current
+dtype policy.

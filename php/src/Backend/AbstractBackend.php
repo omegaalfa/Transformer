@@ -11,6 +11,11 @@ use Omegaalfa\Transformer\Transformer\AttentionMask;
 
 abstract class AbstractBackend implements BackendInterface
 {
+    public function tensorFromFloat32(array $data, Shape $shape): Tensor
+    {
+        throw $this->notImplemented('tensorFromFloat32');
+    }
+
     public function matmul(Tensor $left, Tensor $right): Tensor
     {
         throw $this->notImplemented('matmul');

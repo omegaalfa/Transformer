@@ -6,7 +6,9 @@
 - `FfiBackend` é o ponteiro de desenvolvimento para o tempo de execução Rust.
 - `NativeExtensionBackend` se tornará o ponteiro de extensão Zend para o mesmo ABI C e tempo de execução Rust.
 
-`FfiBackend` cria Tensors residentes com `tensorFromFloat32()` e implementa
+`tensorFromFloat32()` faz parte do contrato comum de backend. `FfiBackend` o
+implementa criando Tensors residentes; backends que ainda não suportam criação
+falham explicitamente. O FFI também implementa
 `add`, `matmul`, `transpose` e `softmax` sobre handles nativos:
 
 ```php

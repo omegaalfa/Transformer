@@ -11,8 +11,13 @@ use Omegaalfa\Transformer\Backend\Contract\ElementWiseBackendInterface;
 use Omegaalfa\Transformer\Backend\Contract\EmbeddingBackendInterface;
 use Omegaalfa\Transformer\Backend\Contract\NormalizationBackendInterface;
 use Omegaalfa\Transformer\Backend\Contract\ShapeBackendInterface;
+use Omegaalfa\Transformer\Tensor\Shape;
+use Omegaalfa\Transformer\Tensor\Tensor;
 
 interface BackendInterface extends AlgebraBackendInterface, ElementWiseBackendInterface, ShapeBackendInterface, ActivationBackendInterface, EmbeddingBackendInterface, NormalizationBackendInterface, AttentionBackendInterface
 {
     public function type(): BackendType;
+
+    /** @param list<float> $data */
+    public function tensorFromFloat32(array $data, Shape $shape): Tensor;
 }

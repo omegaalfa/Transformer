@@ -9,6 +9,10 @@ use Omegaalfa\Transformer\Tensor\Shape;
 
 final readonly class TensorMetadata
 {
+    /**
+     * @param int $offset Absolute byte offset from the beginning of the file.
+     * @param int $length Tensor payload length in bytes.
+     */
     public function __construct(
         public string $name,
         public Shape $shape,
