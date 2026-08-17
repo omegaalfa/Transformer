@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Omegaalfa\Transformer\NN;
 
-use Omegaalfa\Transformer\Tensor\Tensor;
-
 interface Module
 {
-    public function forward(Tensor $input): Tensor;
+    /** @return array<string, Parameter> */
+    public function parameters(): array;
+
+    /** @return array<string, Module> */
+    public function modules(): array;
 }

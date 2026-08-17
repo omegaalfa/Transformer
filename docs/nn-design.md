@@ -1,6 +1,6 @@
 # Revisão da Arquitetura de Redes Neurais (NN-R1)
 
-Status: **revisão de design aprovada; nenhum desenvolvimento de implementação de rede neural é autorizado por este documento**.
+Status: **NN-1, NN-2, NN-3 e NN-4 implementados; componentes posteriores permanecem pendentes**.
 
 A fase Tensor T1–T10 prova a propriedade nativa, ciclo de vida, metadados,
 materialização e execução ponte-a-ponte para adição, multiplicação matricial, transposição e
@@ -64,15 +64,18 @@ Regras para v1:
 
 ## Contrato de módulo
 
-A assinatura atual da `Module::forward(Tensor): Tensor` é muito restritiva como uma interface universal. Embedding começa com IDs de token, e mais tarde a atenção também aceita máscaras. NN-1 deve tornar `Module` o contrato de introspecção/composição:
+`Module` é o contrato explícito de introspecção/composição:
 
 ```text
 parâmetros() -> map<string, Parameter>
 módulos()    -> map<string, Module>
 ```
 
-Módulos concretos declaram seus próprios métodos `forward` tipados. Componentes Tensor-to-Tensor como `Linear`, `LayerNorm` e `GELU` mantêm
-`forward(Tensor): Tensor`. Mapas explícitos são preferidos sobre reflexão ou descoberta de propriedades mágicas. A navegação recursiva constrói um dicionário de estado determinístico.
+`TensorModule extends Module` adiciona `forward(Tensor): Tensor` para módulos
+Tensor-to-Tensor como `Linear`, `LayerNorm` e `GELU`. Módulos com outra
+fronteira declaram uma operação tipada própria; `Embedding` permanece `Module`
+e recebe IDs inteiros em `forwardTokenIds()`. Mapas explícitos são preferidos
+sobre reflexão ou descoberta de propriedades mágicas.
 
 Módulos folha recebem explicitamente um `Runtime` e despacham através do seu backend.
 As entradas, parâmetros e resultados devem usar backends compatíveis, dispositivos e dtypes.
@@ -105,9 +108,9 @@ Linear
   projeção final na última dimensão nativa
 ```
 
-A adição Tensor atual estrita não pode adicionar um bias `[out_features]` a
+A adição Tensor estrita não pode adicionar um bias `[out_features]` a
 `[rows, out_features]`, e a multiplicação matmul aceita apenas rango 2. As entradas do Transformer eventualmente terão dimensões de leitura como
-`[batch, sequence, hidden]`. NN-2 deve, portanto, projetar uma única operação nativa Linear específica que:
+`[batch, sequence, hidden]`. NN-2 implementa uma única operação nativa Linear específica que:
 
 - exija que a última dimensão da entrada seja igual a `input_features`;
 - trate as dimensões anteriores como linhas sem expor uma cópia PHP;
@@ -119,6 +122,16 @@ A adição Tensor atual estrita não pode adicionar um bias `[out_features]` a
 Isso evita adicionar prematuramente semântica de broadcasting ou reshape/view genéricos.
 Os testes de referência ainda comparam sua parte de multiplicação com o núcleo básico.
 
+`Linear` possui `weight: Parameter` obrigatório e `bias: ?Parameter`. Esses
+objetos permanecem residentes durante a vida do módulo. `forward()` recebe o
+input por chamada, delega `linear_last_dim` ao backend e retorna um Tensor novo;
+nenhum input, temporário ou output anterior é armazenado no módulo.
+
+O kernel CPU achata conceitualmente todas as dimensões anteriores em M, sem
+alterar ou copiar metadata do input, reutiliza o dispatcher matmul existente e
+aplica o bias por linha sem expandi-lo fisicamente. Shapes de rank 1 ou superior
+são aceitos; a última dimensão deve coincidir com `input_features`.
+
 ### Embedding
 
 ```text
@@ -128,9 +141,18 @@ Embedding
   coleta linhas
 ```
 
-IDs de token não devem ser codificados como Float32. Porque a saída do tokenizador origina-se em PHP e Tensor v1 intencionalmente suporta apenas Float32, NN-3 deve inicialmente definir uma fronteira dedicada de pesquisa de embedding aceitando IDs de token inteiro validados e um handle de peso Float32. Ele retorna um Tensor nativo Float32 e realiza apenas uma transferência PHP-to-native no limite de entrada do modelo. Um tipo de dado Tensor genérico inteiro é adiado até que outro consumidor real justifique isso.
+`Embedding` possui `weight: Parameter` residente, Float32, contíguo e row-major
+com shape `[vocabulary_size, dimensions]`. Sua API é
+`forwardTokenIds(list<int>, Shape([B,S]))`. IDs são achatados em row-major,
+atravessam a ABI como `int64_t` e nunca são convertidos para Float32. O output é
+um novo Tensor Float32 `[B,S,D]` com Storage independente.
 
-A validação inclui IDs não negativos, limites de vocabulário, forma de saída e conversão de largura de inteiro. Um operador de coleta geral-purpose não é necessário antes deste contrato seja provado.
+PHP valida lista, rank, produto `B*S`, quantidade e intervalo. A bridge cria
+somente um CData `int64_t` temporário; a FFI Rust repete as validações de
+segurança e chama um kernel sobre slices seguros. Erro não consome o weight nem
+publica output parcial. `[0,S]`, `[B,0]` e `[0,0]` são válidos e não acessam o
+weight. `TokenizationResult` continua descrevendo uma sequência; batching e
+padding permanecem fora do tokenizer.
 
 ### LayerNorm
 
@@ -158,9 +180,9 @@ NN-5 apresenta uma única operação explícita Float32 GELU de referência e op
 ```text
 NN-R1  revisão de arquitetura da rede neural                              COMPLETO
 NN-0   ponte nativa do Tensor no PHP                                  COMPLETO
-NN-1   contratos de introspecção e composição para parâmetro e módulo       PENDENTE
-NN-2   Linear com projeção na última dimensão nativa                      PENDENTE
-NN-3   Embedding com pesquisa de token inteiro validada                    PENDENTE
+NN-1   contratos de introspecção e composição para parâmetro e módulo       COMPLETO
+NN-2   Linear com projeção na última dimensão nativa                      COMPLETO
+NN-3   Embedding com pesquisa de token inteiro validada                    COMPLETO
 NN-4   LayerNorm estável                                                   PENDENTE
 NN-5   GELU                                                              PENDENTE
 NN-R2  revisão antes da atenção                                          PENDENTE
@@ -180,3 +202,36 @@ máscaras, escalas e eixo do softmax antes de qualquer implementação de atenç
 - tipos de dados adicionais apenas para representar a saída do tokenizador;
 - SIMD, BLAS, GPU e blocos Transformer fusos;
 - implementação da atenção antes de NN-R2.
+
+## GPU Readiness
+
+O `Linear` PHP depende somente de `Runtime->backend()->linear()`, portanto não
+contém OpenBLAS, ponteiros FFI ou decisões de CPU. Um backend GPU futuro deverá
+oferecer Linear last-dim, além das operações usadas pelos módulos posteriores
+(normalizações, ativações e atenção), sem materializar resultados no PHP.
+
+Antes de CUDA, Tensor/Storage precisam representar explicitamente device e
+storage CPU/GPU, e os backends devem rejeitar operações entre dispositivos sem
+uma transferência explícita. Pesos devem ser carregados uma vez no Storage GPU
+e permanecer na VRAM durante a vida do módulo. Input, weight, bias, temporários
+e output de uma execução devem permanecer no mesmo dispositivo para evitar
+cópias CPU↔GPU por operação.
+
+O backend selecionado pelo Runtime decide entre o dispatcher CPU/OpenBLAS e um
+futuro kernel CUDA/cuBLAS. OpenBLAS continua específico do backend CPU; streams,
+handles cuBLAS, alocadores de VRAM e seleção de kernels continuam específicos do
+backend GPU. Shape, dtype, ownership de Parameter e a semântica last-dim são
+contratos compartilhados e não devem depender de nenhum desses detalhes.
+
+## NN-4 — LayerNorm de inferência
+
+`LayerNorm` mantém `weight` (gamma) e `bias` (beta) como `Parameter` residentes
+de shape `[D]`. `forward()` normaliza somente a última dimensão de um Tensor
+Float32 contíguo e retorna storage novo, sem Tensors intermediários:
+`gamma * (x - mean) / sqrt(variance + epsilon) + beta`. O runtime usa Welford
+com acumuladores Float64 e variância populacional. `epsilon` é `1e-5` por
+default e deve continuar positivo e finito após conversão para Float32.
+
+Rank zero, `D=0`, shapes incompatíveis e qualquer NaN/Inf são rejeitados.
+Dimensões externas vazias são válidas quando `D>0` e preservam exatamente o
+shape. Gamma, beta e input permanecem imutáveis; falhas não publicam output.

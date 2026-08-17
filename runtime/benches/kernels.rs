@@ -20,6 +20,9 @@ mod matmul_dispatch;
 #[path = "../src/kernels/softmax.rs"]
 mod softmax;
 #[allow(dead_code, unused_imports)]
+#[path = "../src/tensor/mod.rs"]
+mod tensor;
+#[allow(dead_code, unused_imports)]
 #[path = "../src/kernels/transpose.rs"]
 mod transpose;
 
@@ -69,6 +72,8 @@ enum Throughput {
 struct Measurement {
     median: Duration,
     p95: Duration,
+    p99: Duration,
+    coefficient_of_variation: f64,
     iterations: usize,
 }
 
@@ -94,6 +99,7 @@ fn main() {
     if matches_filter(&filter, "matmul")
         || matches_filter(&filter, "fusion")
         || matches_filter(&filter, "lifecycle")
+        || matches_filter(&filter, "blas_threads")
     {
         let blas_threads = environment_usize("TRANSFORMER_BLAS_THREADS", 1);
         let blas_info = bench_blas::configure(blas_threads);
@@ -104,6 +110,7 @@ fn main() {
         println!("blas_layout=row_major transpose_a=false transpose_b=false explicit_copy=false");
         if matches_filter(&filter, "matmul") {
             benchmark_matmul(profile, samples, target);
+            benchmark_dispatch_overhead(samples, target);
         }
         if matches_filter(&filter, "fusion") {
             benchmark_matmul_add_fusion(samples, target);
@@ -111,9 +118,15 @@ fn main() {
         if matches_filter(&filter, "lifecycle") {
             benchmark_storage_reuse(samples, target);
         }
+        if matches_filter(&filter, "blas_threads") {
+            benchmark_blas_thread_scaling(samples, target);
+        }
     }
     if matches_filter(&filter, "softmax") {
         benchmark_softmax(profile, samples, target);
+    }
+    if matches_filter(&filter, "vector_exp") {
+        benchmark_vector_exp_softmax(samples, target);
     }
     if matches_filter(&filter, "add") {
         benchmark_add(profile, samples, target);
@@ -467,13 +480,293 @@ fn benchmark_matmul(profile: Profile, samples: usize, target: Duration) {
     }
 }
 
+fn benchmark_blas_thread_scaling(samples: usize, target: Duration) {
+    println!("blas_threads,shape,candidate_threads,layer,baseline_median_us,baseline_p95_us,baseline_p99_us,candidate_median_us,candidate_p95_us,candidate_p99_us,median_speedup,p95_speedup,baseline_cv,candidate_cv");
+    for (k, n) in [(768, 768), (768, 3072), (3072, 768)] {
+        for m in [1, 2, 4, 8, 16, 32, 64, 128] {
+            let a = deterministic_values(m * k, 0.001);
+            let b = deterministic_values(k * n, 0.002);
+            let residual = deterministic_values(m * n, 0.003);
+            for candidate_threads in [2, 4] {
+                let mut baseline_first = vec![0.0; m * n];
+                let mut baseline_second = vec![0.0; m * n];
+                let mut candidate_first = vec![0.0; m * n];
+                let mut candidate_second = vec![0.0; m * n];
+                let (matmul_baseline, matmul_candidate) = measure_thread_pair(
+                    samples,
+                    target,
+                    candidate_threads,
+                    || {
+                        matmul_dispatch::matmul_dispatch_f32(&a, &b, &mut baseline_first, m, k, n)
+                            .unwrap();
+                        black_box(baseline_first[0]);
+                    },
+                    || {
+                        matmul_dispatch::matmul_dispatch_f32(&a, &b, &mut candidate_first, m, k, n)
+                            .unwrap();
+                        black_box(candidate_first[0]);
+                    },
+                );
+                assert_close(&baseline_first, &candidate_first, 1.0e-5);
+                report_thread_pair(
+                    m,
+                    k,
+                    n,
+                    candidate_threads,
+                    "matmul",
+                    &matmul_baseline,
+                    &matmul_candidate,
+                );
+
+                let (pipeline_baseline, pipeline_candidate) = measure_thread_pair(
+                    samples,
+                    target,
+                    candidate_threads,
+                    || {
+                        run_preallocated_pipeline(
+                            &a,
+                            &b,
+                            &residual,
+                            &mut baseline_first,
+                            &mut baseline_second,
+                            m,
+                            k,
+                            n,
+                        );
+                    },
+                    || {
+                        run_preallocated_pipeline(
+                            &a,
+                            &b,
+                            &residual,
+                            &mut candidate_first,
+                            &mut candidate_second,
+                            m,
+                            k,
+                            n,
+                        );
+                    },
+                );
+                assert_close(&baseline_second, &candidate_second, 1.0e-5);
+                report_thread_pair(
+                    m,
+                    k,
+                    n,
+                    candidate_threads,
+                    "pipeline",
+                    &pipeline_baseline,
+                    &pipeline_candidate,
+                );
+            }
+        }
+    }
+    bench_blas::configure(1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_preallocated_pipeline(
+    a: &[f32],
+    b: &[f32],
+    residual: &[f32],
+    first: &mut [f32],
+    second: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    matmul_dispatch::matmul_dispatch_f32(a, b, first, m, k, n).unwrap();
+    add::add_f32(first, residual, second).unwrap();
+    softmax::softmax_last_dim_f32(second, first, n).unwrap();
+    transpose::transpose_f32(first, second, m, n).unwrap();
+    black_box(second[0]);
+}
+
+fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
+    assert_eq!(left.len(), right.len());
+    for (&left, &right) in left.iter().zip(right) {
+        let allowed = tolerance.max(left.abs() * tolerance);
+        assert!((left - right).abs() <= allowed);
+    }
+}
+
+fn report_thread_pair(
+    m: usize,
+    k: usize,
+    n: usize,
+    candidate_threads: usize,
+    layer: &str,
+    baseline: &Measurement,
+    candidate: &Measurement,
+) {
+    println!(
+        "blas_threads,{m}x{k}_x_{k}x{n},{candidate_threads},{layer},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.6},{:.6}",
+        baseline.median.as_secs_f64() * 1e6,
+        baseline.p95.as_secs_f64() * 1e6,
+        baseline.p99.as_secs_f64() * 1e6,
+        candidate.median.as_secs_f64() * 1e6,
+        candidate.p95.as_secs_f64() * 1e6,
+        candidate.p99.as_secs_f64() * 1e6,
+        baseline.median.as_secs_f64() / candidate.median.as_secs_f64(),
+        baseline.p95.as_secs_f64() / candidate.p95.as_secs_f64(),
+        baseline.coefficient_of_variation,
+        candidate.coefficient_of_variation,
+    );
+}
+
+fn measure_thread_pair<F, G>(
+    samples: usize,
+    target: Duration,
+    candidate_threads: usize,
+    mut baseline: F,
+    mut candidate: G,
+) -> (Measurement, Measurement)
+where
+    F: FnMut(),
+    G: FnMut(),
+{
+    bench_blas::configure(1);
+    for _ in 0..5 {
+        baseline();
+    }
+    let started = Instant::now();
+    baseline();
+    let baseline_once = started.elapsed().max(Duration::from_nanos(1));
+    bench_blas::configure(candidate_threads);
+    for _ in 0..5 {
+        candidate();
+    }
+    let started = Instant::now();
+    candidate();
+    let candidate_once = started.elapsed().max(Duration::from_nanos(1));
+    let slower = baseline_once.max(candidate_once);
+    let iterations = (target.as_nanos().max(1) / slower.as_nanos()).clamp(1, 1_000_000) as usize;
+    let mut baseline_timings = Vec::with_capacity(samples);
+    let mut candidate_timings = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let mut run_baseline = || {
+            bench_blas::configure(1);
+            let started = Instant::now();
+            for _ in 0..iterations {
+                baseline();
+            }
+            baseline_timings.push(started.elapsed().div_f64(iterations as f64));
+        };
+        let mut run_candidate = || {
+            bench_blas::configure(candidate_threads);
+            let started = Instant::now();
+            for _ in 0..iterations {
+                candidate();
+            }
+            candidate_timings.push(started.elapsed().div_f64(iterations as f64));
+        };
+        if sample % 2 == 0 {
+            run_baseline();
+            run_candidate();
+        } else {
+            run_candidate();
+            run_baseline();
+        }
+    }
+    (
+        summarize_measurements(baseline_timings, iterations),
+        summarize_measurements(candidate_timings, iterations),
+    )
+}
+
+fn benchmark_dispatch_overhead(samples: usize, target: Duration) {
+    println!(
+        "dispatch,case,selected_backend,select_median_ns,select_p95_ns,direct_median_us,direct_p95_us,dispatcher_median_us,dispatcher_p95_us,dispatcher_overhead_us,dispatcher_ratio"
+    );
+    for (m, k, n) in [
+        (1, 768, 768),
+        (2, 768, 768),
+        (4, 768, 768),
+        (2, 768, 3072),
+        (2, 3072, 768),
+        (128, 768, 768),
+    ] {
+        let backend = matmul_dispatch::select_backend(m, k, n, true);
+        let selection = measure(samples, target, || {
+            black_box(matmul_dispatch::select_backend(
+                black_box(m),
+                black_box(k),
+                black_box(n),
+                black_box(true),
+            ));
+        });
+        let a = deterministic_values(m * k, 0.001);
+        let b = deterministic_values(k * n, 0.002);
+        let mut direct_output = vec![0.0; m * n];
+        let mut dispatched_output = vec![0.0; m * n];
+        let (direct, dispatched) = measure_pair(
+            samples,
+            target,
+            || {
+                run_selected_backend(backend, &a, &b, &mut direct_output, m, k, n).unwrap();
+                black_box(direct_output[0]);
+            },
+            || {
+                matmul_dispatch::matmul_dispatch_f32(&a, &b, &mut dispatched_output, m, k, n)
+                    .unwrap();
+                black_box(dispatched_output[0]);
+            },
+        );
+        assert_eq!(direct_output, dispatched_output);
+        let overhead = dispatched.median.saturating_sub(direct.median);
+        println!(
+            "dispatch,{m}x{k}_x_{k}x{n},{backend:?},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.6}",
+            selection.median.as_secs_f64() * 1e9,
+            selection.p95.as_secs_f64() * 1e9,
+            direct.median.as_secs_f64() * 1e6,
+            direct.p95.as_secs_f64() * 1e6,
+            dispatched.median.as_secs_f64() * 1e6,
+            dispatched.p95.as_secs_f64() * 1e6,
+            overhead.as_secs_f64() * 1e6,
+            dispatched.median.as_secs_f64() / direct.median.as_secs_f64(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selected_backend(
+    backend: matmul_dispatch::MatmulBackend,
+    a: &[f32],
+    b: &[f32],
+    output: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), matmul::MatmulError> {
+    match backend {
+        matmul_dispatch::MatmulBackend::Reference => matmul::matmul_f32(a, b, output, m, k, n),
+        matmul_dispatch::MatmulBackend::CacheFriendly => {
+            matmul::matmul_cache_friendly_f32(a, b, output, m, k, n)
+        }
+        matmul_dispatch::MatmulBackend::Tiled => matmul::matmul_tiled_f32(a, b, output, m, k, n),
+        matmul_dispatch::MatmulBackend::Blas => blas::try_matmul_blas_f32(a, b, output, m, k, n)
+            .unwrap_or_else(|| matmul::matmul_tiled_f32(a, b, output, m, k, n)),
+    }
+}
+
 fn crossover_matmul_cases() -> Vec<(usize, usize, usize)> {
     const M_VALUES: [usize; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
     const PROJECTIONS: [(usize, usize); 3] = [(768, 768), (768, 3072), (3072, 768)];
+    let maximum_m = environment_usize("TRANSFORMER_BENCH_MAX_M", usize::MAX);
+    let projection = env::var("TRANSFORMER_BENCH_PROJECTION").ok();
 
     PROJECTIONS
         .into_iter()
-        .flat_map(|(k, n)| M_VALUES.into_iter().map(move |m| (m, k, n)))
+        .filter(|(k, n)| {
+            projection
+                .as_deref()
+                .map_or(true, |expected| expected == format!("{k}x{n}"))
+        })
+        .flat_map(|(k, n)| {
+            M_VALUES
+                .into_iter()
+                .filter(move |m| *m <= maximum_m)
+                .map(move |m| (m, k, n))
+        })
         .collect()
 }
 
@@ -545,6 +838,411 @@ fn benchmark_softmax(profile: Profile, samples: usize, target: Duration) {
         rank_two,
         Throughput::Gigabytes(8.0 * input.len() as f64),
     );
+    benchmark_combined_softmax_pass(samples, target);
+}
+
+fn softmax_combined_validation_max_f32(
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), softmax::SoftmaxError> {
+    if input.is_empty() {
+        return Err(softmax::SoftmaxError::EmptyInput);
+    }
+    if input.len() != output.len() {
+        return Err(softmax::SoftmaxError::LengthMismatch);
+    }
+    let mut maximum = input[0];
+    if !maximum.is_finite() {
+        return Err(softmax::SoftmaxError::NonFiniteInput);
+    }
+    for &value in &input[1..] {
+        if !value.is_finite() {
+            return Err(softmax::SoftmaxError::NonFiniteInput);
+        }
+        maximum = maximum.max(value);
+    }
+    let mut sum = 0.0;
+    for (destination, &value) in output.iter_mut().zip(input) {
+        let exponential = (value - maximum).exp();
+        *destination = exponential;
+        sum += exponential;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(softmax::SoftmaxError::InvalidNormalization);
+    }
+    for value in output {
+        *value /= sum;
+    }
+    Ok(())
+}
+
+fn softmax_last_dim_combined_f32(
+    input: &[f32],
+    output: &mut [f32],
+    last_dim: usize,
+) -> Result<(), softmax::SoftmaxError> {
+    if input.is_empty() || last_dim == 0 {
+        return Err(softmax::SoftmaxError::EmptyInput);
+    }
+    if input.len() != output.len() || input.len() % last_dim != 0 {
+        return Err(softmax::SoftmaxError::LengthMismatch);
+    }
+    for (input_row, output_row) in input
+        .chunks_exact(last_dim)
+        .zip(output.chunks_exact_mut(last_dim))
+    {
+        softmax_combined_validation_max_f32(input_row, output_row)?;
+    }
+    Ok(())
+}
+
+fn benchmark_combined_softmax_pass(samples: usize, target: Duration) {
+    let input = deterministic_values(128 * 768, 0.01);
+    let mut expected = vec![0.0; input.len()];
+    let mut actual = vec![0.0; input.len()];
+    softmax::softmax_last_dim_f32(&input, &mut expected, 768).unwrap();
+    softmax_last_dim_combined_f32(&input, &mut actual, 768).unwrap();
+    assert_eq!(actual, expected);
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(
+            softmax_combined_validation_max_f32(&[0.0, invalid], &mut [0.0; 2]),
+            softmax::softmax_f32(&[0.0, invalid], &mut [0.0; 2])
+        );
+    }
+    let (baseline, candidate) = measure_pair(
+        samples,
+        target,
+        || {
+            softmax::softmax_last_dim_f32(&input, &mut expected, 768).unwrap();
+            black_box(expected[0]);
+        },
+        || {
+            softmax_last_dim_combined_f32(&input, &mut actual, 768).unwrap();
+            black_box(actual[0]);
+        },
+    );
+    println!(
+        "softmax_combined,128x768,kernel,{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        baseline.median.as_secs_f64() * 1e6,
+        baseline.p95.as_secs_f64() * 1e6,
+        candidate.median.as_secs_f64() * 1e6,
+        candidate.p95.as_secs_f64() * 1e6,
+        baseline.median.as_secs_f64() / candidate.median.as_secs_f64(),
+        baseline.p95.as_secs_f64() / candidate.p95.as_secs_f64(),
+    );
+
+    let (m, k, n) = (128, 768, 768);
+    let a = deterministic_values(m * k, 0.001);
+    let b = deterministic_values(k * n, 0.002);
+    let residual = deterministic_values(m * n, 0.003);
+    let (pipeline_baseline, pipeline_candidate) = measure_pair(
+        samples,
+        target,
+        || {
+            black_box(run_allocating_pipeline(&a, &b, &residual, m, k, n));
+        },
+        || {
+            black_box(run_pipeline_combined_softmax(&a, &b, &residual, m, k, n));
+        },
+    );
+    assert_eq!(
+        run_pipeline_combined_softmax(&a, &b, &residual, m, k, n).values,
+        run_allocating_pipeline(&a, &b, &residual, m, k, n).values
+    );
+    println!(
+        "softmax_combined,128x768,pipeline,{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        pipeline_baseline.median.as_secs_f64() * 1e6,
+        pipeline_baseline.p95.as_secs_f64() * 1e6,
+        pipeline_candidate.median.as_secs_f64() * 1e6,
+        pipeline_candidate.p95.as_secs_f64() * 1e6,
+        pipeline_baseline.median.as_secs_f64() / pipeline_candidate.median.as_secs_f64(),
+        pipeline_baseline.p95.as_secs_f64() / pipeline_candidate.p95.as_secs_f64(),
+    );
+}
+
+fn softmax_vector_exp_f32(input: &[f32], output: &mut [f32]) -> Result<(), softmax::SoftmaxError> {
+    if input.is_empty() {
+        return Err(softmax::SoftmaxError::EmptyInput);
+    }
+    if input.len() != output.len() {
+        return Err(softmax::SoftmaxError::LengthMismatch);
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(softmax::SoftmaxError::NonFiniteInput);
+    }
+    let maximum = input[1..].iter().copied().fold(input[0], f32::max);
+    let mut sum = 0.0;
+    let mut processed = 0;
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: Runtime feature detection covers every required instruction,
+        // and the helper reads/writes exactly eight valid elements per chunk.
+        processed = unsafe { vector_exp_chunks(input, output, maximum, &mut sum) };
+    }
+    for index in processed..input.len() {
+        let exponential = (input[index] - maximum).exp();
+        output[index] = exponential;
+        sum += exponential;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(softmax::SoftmaxError::InvalidNormalization);
+    }
+    for value in output {
+        *value /= sum;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vector_exp_chunks(
+    input: &[f32],
+    output: &mut [f32],
+    maximum: f32,
+    sum: &mut f32,
+) -> usize {
+    use std::arch::x86_64::*;
+
+    let processed = input.len() / 8 * 8;
+    let maximum = _mm256_set1_ps(maximum);
+    for index in (0..processed).step_by(8) {
+        // SAFETY: `processed` is rounded down to complete eight-float chunks.
+        let values = unsafe { _mm256_loadu_ps(input.as_ptr().add(index)) };
+        // SAFETY: This function has the same enabled target features.
+        let exponentials = unsafe { exp256_ps(_mm256_sub_ps(values, maximum)) };
+        // SAFETY: The output length equals the input length and this is a full chunk.
+        unsafe { _mm256_storeu_ps(output.as_mut_ptr().add(index), exponentials) };
+        for value in &output[index..index + 8] {
+            *sum += *value;
+        }
+    }
+    processed
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp256_ps(input: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    // SAFETY: The caller guarantees AVX2 and FMA support.
+    unsafe {
+        let input = _mm256_max_ps(
+            _mm256_set1_ps(-88.376_26),
+            _mm256_min_ps(input, _mm256_set1_ps(88.376_26)),
+        );
+        let fx = _mm256_floor_ps(_mm256_fmadd_ps(
+            input,
+            _mm256_set1_ps(std::f32::consts::LOG2_E),
+            _mm256_set1_ps(0.5),
+        ));
+        let reduced = _mm256_sub_ps(
+            _mm256_sub_ps(input, _mm256_mul_ps(fx, _mm256_set1_ps(0.693_359_4))),
+            _mm256_mul_ps(fx, _mm256_set1_ps(-2.121_944_4e-4)),
+        );
+        let squared = _mm256_mul_ps(reduced, reduced);
+        let mut polynomial = _mm256_set1_ps(1.987_569_1e-4);
+        for coefficient in [
+            1.398_2e-3,
+            8.333_452e-3,
+            4.166_579_6e-2,
+            1.666_666_6e-1,
+            5.0e-1,
+        ] {
+            polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(coefficient));
+        }
+        polynomial = _mm256_fmadd_ps(polynomial, squared, reduced);
+        polynomial = _mm256_add_ps(polynomial, _mm256_set1_ps(1.0));
+        let exponent = _mm256_slli_epi32(
+            _mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)),
+            23,
+        );
+        _mm256_mul_ps(polynomial, _mm256_castsi256_ps(exponent))
+    }
+}
+
+fn softmax_last_dim_vector_exp_f32(
+    input: &[f32],
+    output: &mut [f32],
+    last_dim: usize,
+) -> Result<(), softmax::SoftmaxError> {
+    if input.is_empty() || last_dim == 0 {
+        return Err(softmax::SoftmaxError::EmptyInput);
+    }
+    if input.len() != output.len() || input.len() % last_dim != 0 {
+        return Err(softmax::SoftmaxError::LengthMismatch);
+    }
+    for (input_row, output_row) in input
+        .chunks_exact(last_dim)
+        .zip(output.chunks_exact_mut(last_dim))
+    {
+        softmax_vector_exp_f32(input_row, output_row)?;
+    }
+    Ok(())
+}
+
+fn benchmark_vector_exp_softmax(samples: usize, target: Duration) {
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "vector_exp_cpu,avx2={},fma={}",
+        std::is_x86_feature_detected!("avx2"),
+        std::is_x86_feature_detected!("fma")
+    );
+    println!("vector_exp,rows,last_dim,layer,baseline_median_us,baseline_p95_us,baseline_p99_us,candidate_median_us,candidate_p95_us,candidate_p99_us,median_speedup,p95_speedup,max_abs,max_rel,max_ulp,max_sum_error");
+    for last_dim in [128, 768, 2048, 3072] {
+        for rows in [1, 2, 8, 32, 128] {
+            let input = deterministic_values(rows * last_dim, 0.01);
+            let mut baseline_output = vec![0.0; input.len()];
+            let mut candidate_output = vec![0.0; input.len()];
+            softmax::softmax_last_dim_f32(&input, &mut baseline_output, last_dim).unwrap();
+            softmax_last_dim_vector_exp_f32(&input, &mut candidate_output, last_dim).unwrap();
+            let errors = softmax_errors(&baseline_output, &candidate_output, last_dim);
+            let (baseline, candidate) = measure_pair(
+                samples,
+                target,
+                || {
+                    softmax::softmax_last_dim_f32(&input, &mut baseline_output, last_dim).unwrap();
+                    black_box(baseline_output[0]);
+                },
+                || {
+                    softmax_last_dim_vector_exp_f32(&input, &mut candidate_output, last_dim)
+                        .unwrap();
+                    black_box(candidate_output[0]);
+                },
+            );
+            report_vector_exp(rows, last_dim, "kernel", &baseline, &candidate, errors);
+        }
+    }
+
+    for (k, n) in [(768, 768), (768, 3072), (3072, 768)] {
+        let m = 128;
+        let a = deterministic_values(m * k, 0.001);
+        let b = deterministic_values(k * n, 0.002);
+        let residual = deterministic_values(m * n, 0.003);
+        let (baseline, candidate) = measure_pair(
+            samples,
+            target,
+            || {
+                black_box(run_allocating_pipeline(&a, &b, &residual, m, k, n));
+            },
+            || {
+                black_box(run_pipeline_vector_exp_softmax(&a, &b, &residual, m, k, n));
+            },
+        );
+        let expected = run_allocating_pipeline(&a, &b, &residual, m, k, n);
+        let actual = run_pipeline_vector_exp_softmax(&a, &b, &residual, m, k, n);
+        let pointwise = pointwise_errors(&expected.values, &actual.values);
+        let errors = (pointwise.0, pointwise.1, pointwise.2, 0.0);
+        report_vector_exp(
+            m,
+            n,
+            &format!("pipeline_k{k}"),
+            &baseline,
+            &candidate,
+            errors,
+        );
+    }
+
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(
+            softmax_vector_exp_f32(&[0.0, invalid], &mut [0.0; 2]),
+            softmax::softmax_f32(&[0.0, invalid], &mut [0.0; 2])
+        );
+    }
+}
+
+fn softmax_errors(expected: &[f32], actual: &[f32], last_dim: usize) -> (f32, f32, u32, f32) {
+    let pointwise = pointwise_errors(expected, actual);
+    let maximum_sum_error = actual
+        .chunks_exact(last_dim)
+        .map(|row| (row.iter().sum::<f32>() - 1.0).abs())
+        .fold(0.0_f32, f32::max);
+    (pointwise.0, pointwise.1, pointwise.2, maximum_sum_error)
+}
+
+fn pointwise_errors(expected: &[f32], actual: &[f32]) -> (f32, f32, u32) {
+    let mut maximum_absolute = 0.0_f32;
+    let mut maximum_relative = 0.0_f32;
+    let mut maximum_ulp = 0_u32;
+    for (&expected, &actual) in expected.iter().zip(actual) {
+        let absolute = (expected - actual).abs();
+        maximum_absolute = maximum_absolute.max(absolute);
+        if expected != 0.0 {
+            maximum_relative = maximum_relative.max(absolute / expected.abs());
+        }
+        maximum_ulp = maximum_ulp.max(expected.to_bits().abs_diff(actual.to_bits()));
+    }
+    (maximum_absolute, maximum_relative, maximum_ulp)
+}
+
+fn report_vector_exp(
+    rows: usize,
+    last_dim: usize,
+    layer: &str,
+    baseline: &Measurement,
+    candidate: &Measurement,
+    errors: (f32, f32, u32, f32),
+) {
+    println!(
+        "vector_exp,{rows},{last_dim},{layer},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.9},{:.9},{},{:.9}",
+        baseline.median.as_secs_f64() * 1e6,
+        baseline.p95.as_secs_f64() * 1e6,
+        baseline.p99.as_secs_f64() * 1e6,
+        candidate.median.as_secs_f64() * 1e6,
+        candidate.p95.as_secs_f64() * 1e6,
+        candidate.p99.as_secs_f64() * 1e6,
+        baseline.median.as_secs_f64() / candidate.median.as_secs_f64(),
+        baseline.p95.as_secs_f64() / candidate.p95.as_secs_f64(),
+        errors.0,
+        errors.1,
+        errors.2,
+        errors.3,
+    );
+}
+
+fn run_pipeline_vector_exp_softmax(
+    a: &[f32],
+    b: &[f32],
+    residual: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Box<OwnedBenchTensor> {
+    let mut multiplied = vec![0.0; m * n];
+    let mut added = vec![0.0; m * n];
+    let mut normalized = vec![0.0; m * n];
+    let mut transposed = vec![0.0; m * n];
+    matmul_dispatch::matmul_dispatch_f32(a, b, &mut multiplied, m, k, n).unwrap();
+    add::add_f32(&multiplied, residual, &mut added).unwrap();
+    softmax_last_dim_vector_exp_f32(&added, &mut normalized, n).unwrap();
+    transpose::transpose_f32(&normalized, &mut transposed, m, n).unwrap();
+    Box::new(OwnedBenchTensor {
+        values: transposed,
+        rows: n,
+        columns: m,
+    })
+}
+
+fn run_pipeline_combined_softmax(
+    a: &[f32],
+    b: &[f32],
+    residual: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Box<OwnedBenchTensor> {
+    let mut multiplied = vec![0.0; m * n];
+    let mut added = vec![0.0; m * n];
+    let mut normalized = vec![0.0; m * n];
+    let mut transposed = vec![0.0; m * n];
+    matmul_dispatch::matmul_dispatch_f32(a, b, &mut multiplied, m, k, n).unwrap();
+    add::add_f32(&multiplied, residual, &mut added).unwrap();
+    softmax_last_dim_combined_f32(&added, &mut normalized, n).unwrap();
+    transpose::transpose_f32(&normalized, &mut transposed, m, n).unwrap();
+    Box::new(OwnedBenchTensor {
+        values: transposed,
+        rows: n,
+        columns: m,
+    })
 }
 
 fn benchmark_add(profile: Profile, samples: usize, target: Duration) {
@@ -580,6 +1278,8 @@ fn benchmark_transpose(profile: Profile, samples: usize, target: Duration) {
         }
     };
 
+    validate_transpose_candidates();
+    println!("transpose_a_b,shape,variant,baseline_median_us,baseline_p95_us,baseline_p99_us,candidate_median_us,candidate_p95_us,candidate_p99_us,median_speedup,p95_speedup");
     for &(rows, columns) in cases {
         let input = deterministic_values(rows * columns, 0.001);
         let mut output = vec![0.0; rows * columns];
@@ -594,7 +1294,246 @@ fn benchmark_transpose(profile: Profile, samples: usize, target: Duration) {
             measurement,
             Throughput::Gigabytes(8.0 * rows as f64 * columns as f64),
         );
+
+        for tile in [4, 8, 16, 32, 64, 128] {
+            let mut baseline_output = vec![0.0; rows * columns];
+            let mut candidate_output = vec![0.0; rows * columns];
+            transpose::transpose_f32(&input, &mut baseline_output, rows, columns).unwrap();
+            transpose_tiled_f32(&input, &mut candidate_output, rows, columns, tile);
+            assert_eq!(candidate_output, baseline_output);
+            let (baseline, candidate) = measure_pair(
+                samples,
+                target,
+                || {
+                    transpose::transpose_f32(&input, &mut baseline_output, rows, columns).unwrap();
+                    black_box(baseline_output[0]);
+                },
+                || {
+                    transpose_tiled_f32(&input, &mut candidate_output, rows, columns, tile);
+                    black_box(candidate_output[0]);
+                },
+            );
+            println!(
+                "transpose_a_b,{rows}x{columns},tile_{tile},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+                baseline.median.as_secs_f64() * 1e6,
+                baseline.p95.as_secs_f64() * 1e6,
+                baseline.p99.as_secs_f64() * 1e6,
+                candidate.median.as_secs_f64() * 1e6,
+                candidate.p95.as_secs_f64() * 1e6,
+                candidate.p99.as_secs_f64() * 1e6,
+                baseline.median.as_secs_f64() / candidate.median.as_secs_f64(),
+                baseline.p95.as_secs_f64() / candidate.p95.as_secs_f64(),
+            );
+        }
     }
+
+    benchmark_transpose_pipeline(samples, target);
+    benchmark_transpose_tensor_model(samples, target);
+    benchmark_transpose_selection(samples, target);
+}
+
+fn validate_transpose_candidates() {
+    for (rows, columns) in [(1, 1), (2, 3), (3, 5), (7, 17), (31, 33), (128, 768)] {
+        let input: Vec<f32> = (0..rows * columns)
+            .map(|index| match index % 5 {
+                0 => 0.0,
+                1 => -(index as f32),
+                2 => 1.0e20,
+                3 => 1.0e-20,
+                _ => index as f32,
+            })
+            .collect();
+        let mut expected = vec![0.0; input.len()];
+        transpose::transpose_f32(&input, &mut expected, rows, columns).unwrap();
+        for tile in [4, 8, 16, 32, 64, 128] {
+            let mut actual = vec![f32::NAN; input.len()];
+            transpose_tiled_f32(&input, &mut actual, rows, columns, tile);
+            assert_eq!(
+                actual, expected,
+                "transpose parity failed for {rows}x{columns}, tile={tile}"
+            );
+        }
+    }
+}
+
+fn transpose_tiled_f32(
+    input: &[f32],
+    output: &mut [f32],
+    rows: usize,
+    columns: usize,
+    tile: usize,
+) {
+    for row_start in (0..rows).step_by(tile) {
+        let row_end = (row_start + tile).min(rows);
+        for column_start in (0..columns).step_by(tile) {
+            let column_end = (column_start + tile).min(columns);
+            for row in row_start..row_end {
+                for column in column_start..column_end {
+                    output[column * rows + row] = input[row * columns + column];
+                }
+            }
+        }
+    }
+}
+
+fn benchmark_transpose_pipeline(samples: usize, target: Duration) {
+    let (m, k, n) = (128, 768, 768);
+    let a = deterministic_values(m * k, 0.001);
+    let b = deterministic_values(k * n, 0.002);
+    let residual = deterministic_values(m * n, 0.003);
+    println!(
+        "transpose_pipeline,variant,baseline_median_us,baseline_p95_us,baseline_p99_us,candidate_median_us,candidate_p95_us,candidate_p99_us,median_speedup,p95_speedup"
+    );
+    for tile in [4, 8, 16, 32, 64, 128] {
+        let (baseline, candidate) = measure_pair(
+            samples,
+            target,
+            || {
+                black_box(run_allocating_pipeline(&a, &b, &residual, m, k, n));
+            },
+            || {
+                black_box(run_allocating_pipeline_tiled_transpose(
+                    &a, &b, &residual, m, k, n, tile,
+                ));
+            },
+        );
+        let expected = run_allocating_pipeline(&a, &b, &residual, m, k, n);
+        let actual = run_allocating_pipeline_tiled_transpose(&a, &b, &residual, m, k, n, tile);
+        assert_eq!(actual.values, expected.values);
+        println!(
+            "transpose_pipeline,tile_{tile},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            baseline.median.as_secs_f64() * 1e6,
+            baseline.p95.as_secs_f64() * 1e6,
+            baseline.p99.as_secs_f64() * 1e6,
+            candidate.median.as_secs_f64() * 1e6,
+            candidate.p95.as_secs_f64() * 1e6,
+            candidate.p99.as_secs_f64() * 1e6,
+            baseline.median.as_secs_f64() / candidate.median.as_secs_f64(),
+            baseline.p95.as_secs_f64() / candidate.p95.as_secs_f64(),
+        );
+    }
+}
+
+fn benchmark_transpose_tensor_model(samples: usize, target: Duration) {
+    let (m, k, n) = (128, 768, 768);
+    let a = tensor::Tensor::from_vec(
+        deterministic_values(m * k, 0.001),
+        tensor::Shape::new(vec![m, k]).unwrap(),
+    )
+    .unwrap();
+    let b = tensor::Tensor::from_vec(
+        deterministic_values(k * n, 0.002),
+        tensor::Shape::new(vec![k, n]).unwrap(),
+    )
+    .unwrap();
+    let residual = tensor::Tensor::from_vec(
+        deterministic_values(m * n, 0.003),
+        tensor::Shape::new(vec![m, n]).unwrap(),
+    )
+    .unwrap();
+    println!("transpose_tensor_model,variant,baseline_median_us,baseline_p95_us,candidate_median_us,candidate_p95_us,median_speedup,p95_speedup");
+    for tile in [4, 8, 16, 32, 64, 128] {
+        let (baseline, candidate) = measure_pair(
+            samples,
+            target,
+            || {
+                black_box(run_tensor_pipeline(&a, &b, &residual, None));
+            },
+            || {
+                black_box(run_tensor_pipeline(&a, &b, &residual, Some(tile)));
+            },
+        );
+        assert_eq!(
+            run_tensor_pipeline(&a, &b, &residual, None).as_slice(),
+            run_tensor_pipeline(&a, &b, &residual, Some(tile)).as_slice()
+        );
+        println!(
+            "transpose_tensor_model,tile_{tile},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            baseline.median.as_secs_f64() * 1e6,
+            baseline.p95.as_secs_f64() * 1e6,
+            candidate.median.as_secs_f64() * 1e6,
+            candidate.p95.as_secs_f64() * 1e6,
+            baseline.median.as_secs_f64() / candidate.median.as_secs_f64(),
+            baseline.p95.as_secs_f64() / candidate.p95.as_secs_f64(),
+        );
+    }
+}
+
+fn run_tensor_pipeline(
+    a: &tensor::Tensor,
+    b: &tensor::Tensor,
+    residual: &tensor::Tensor,
+    transpose_tile: Option<usize>,
+) -> tensor::Tensor {
+    let (m, k, n) = (
+        a.shape().as_slice()[0],
+        a.shape().as_slice()[1],
+        b.shape().as_slice()[1],
+    );
+    let shape = tensor::Shape::new(vec![m, n]).unwrap();
+    let mut multiplied = vec![0.0; shape.numel()];
+    matmul_dispatch::matmul_dispatch_f32(a.as_slice(), b.as_slice(), &mut multiplied, m, k, n)
+        .unwrap();
+    let multiplied = tensor::Tensor::from_vec(multiplied, shape.clone()).unwrap();
+    let mut added = vec![0.0; shape.numel()];
+    add::add_f32(multiplied.as_slice(), residual.as_slice(), &mut added).unwrap();
+    let added = tensor::Tensor::from_vec(added, shape.clone()).unwrap();
+    let mut normalized = vec![0.0; shape.numel()];
+    softmax::softmax_last_dim_f32(added.as_slice(), &mut normalized, n).unwrap();
+    let normalized = tensor::Tensor::from_vec(normalized, shape).unwrap();
+    let output_shape = tensor::Shape::new(vec![n, m]).unwrap();
+    let mut output = vec![0.0; output_shape.numel()];
+    if let Some(tile) = transpose_tile {
+        transpose_tiled_f32(normalized.as_slice(), &mut output, m, n, tile);
+    } else {
+        transpose::transpose_f32(normalized.as_slice(), &mut output, m, n).unwrap();
+    }
+    tensor::Tensor::from_vec(output, output_shape).unwrap()
+}
+
+fn select_transpose_tile(rows: usize, columns: usize) -> usize {
+    if rows > columns {
+        8
+    } else {
+        16
+    }
+}
+
+fn benchmark_transpose_selection(samples: usize, target: Duration) {
+    for (rows, columns) in [(128, 768), (768, 768), (768, 3072), (3072, 768)] {
+        let measurement = measure(samples, target, || {
+            black_box(select_transpose_tile(black_box(rows), black_box(columns)));
+        });
+        println!(
+            "transpose_selection,{rows}x{columns},tile_{},{:.3},{:.3},{:.3}",
+            select_transpose_tile(rows, columns),
+            measurement.median.as_secs_f64() * 1e9,
+            measurement.p95.as_secs_f64() * 1e9,
+            measurement.p99.as_secs_f64() * 1e9,
+        );
+    }
+}
+
+fn run_allocating_pipeline_tiled_transpose(
+    a: &[f32],
+    b: &[f32],
+    residual: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    tile: usize,
+) -> Box<OwnedBenchTensor> {
+    let mut current = vec![0.0; m * n];
+    let mut scratch = vec![0.0; m * n];
+    matmul_dispatch::matmul_dispatch_f32(a, b, &mut current, m, k, n).unwrap();
+    add::add_f32(&current, residual, &mut scratch).unwrap();
+    softmax::softmax_last_dim_f32(&scratch, &mut current, n).unwrap();
+    transpose_tiled_f32(&current, &mut scratch, m, n, tile);
+    Box::new(OwnedBenchTensor {
+        values: scratch,
+        rows: n,
+        columns: m,
+    })
 }
 
 fn measure<F>(samples: usize, target: Duration, mut operation: F) -> Measurement
@@ -624,6 +1563,8 @@ where
     Measurement {
         median: timings[timings.len() / 2],
         p95: timings[((timings.len() - 1) * 95).div_ceil(100)],
+        p99: timings[((timings.len() - 1) * 99).div_ceil(100)],
+        coefficient_of_variation: coefficient_of_variation(&timings),
         iterations,
     }
 }
@@ -684,9 +1625,38 @@ where
     let summarize = |timings: &[Duration]| Measurement {
         median: timings[timings.len() / 2],
         p95: timings[((timings.len() - 1) * 95).div_ceil(100)],
+        p99: timings[((timings.len() - 1) * 99).div_ceil(100)],
+        coefficient_of_variation: coefficient_of_variation(timings),
         iterations,
     };
     (summarize(&baseline_timings), summarize(&candidate_timings))
+}
+
+fn coefficient_of_variation(timings: &[Duration]) -> f64 {
+    let mean = timings.iter().map(Duration::as_secs_f64).sum::<f64>() / timings.len() as f64;
+    if mean == 0.0 {
+        return 0.0;
+    }
+    let variance = timings
+        .iter()
+        .map(|timing| {
+            let difference = timing.as_secs_f64() - mean;
+            difference * difference
+        })
+        .sum::<f64>()
+        / timings.len() as f64;
+    variance.sqrt() / mean
+}
+
+fn summarize_measurements(mut timings: Vec<Duration>, iterations: usize) -> Measurement {
+    timings.sort_unstable();
+    Measurement {
+        median: timings[timings.len() / 2],
+        p95: timings[((timings.len() - 1) * 95).div_ceil(100)],
+        p99: timings[((timings.len() - 1) * 99).div_ceil(100)],
+        coefficient_of_variation: coefficient_of_variation(&timings),
+        iterations,
+    }
 }
 
 fn report(kernel: &str, case: &str, measurement: Measurement, throughput: Throughput) {

@@ -125,6 +125,25 @@ final class Tensor
     {
         return $this->fromNativeBinary($other, 'matmul');
     }
+    public function linear(self $weight, ?self $bias = null): self
+    {
+        $storage = $this->nativeStorage()->linear(
+            $weight->nativeStorage(),
+            $bias?->nativeStorage(),
+        );
+
+        return new self($storage->shape(), $storage);
+    }
+    public function layerNorm(self $weight, self $bias, float $epsilon = 1.0e-5): self
+    {
+        $storage = $this->nativeStorage()->layerNorm(
+            $weight->nativeStorage(),
+            $bias->nativeStorage(),
+            $epsilon,
+        );
+
+        return new self($storage->shape(), $storage);
+    }
     public function transpose(?int $axisA = null, ?int $axisB = null): self
     {
         if ($axisA !== null || $axisB !== null) {

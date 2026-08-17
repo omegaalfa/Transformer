@@ -51,6 +51,29 @@ int transformer_tensor_matmul(
     TransformerTensor** output
 );
 
+int transformer_tensor_linear_last_dim(
+    const TransformerTensor* input,
+    const TransformerTensor* weight,
+    const TransformerTensor* bias,
+    TransformerTensor** output
+);
+
+int transformer_tensor_layer_norm(
+    const TransformerTensor* input,
+    const TransformerTensor* weight,
+    const TransformerTensor* bias,
+    float epsilon,
+    TransformerTensor** output
+);
+
+int transformer_tensor_embedding(
+    const int64_t* token_ids,
+    size_t batch,
+    size_t sequence,
+    const TransformerTensor* weight,
+    TransformerTensor** output
+);
+
 int transformer_tensor_transpose(
     const TransformerTensor* input,
     TransformerTensor** output

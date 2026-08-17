@@ -14,6 +14,18 @@ abstract class AbstractBackend implements BackendInterface
     {
         throw $this->notImplemented('matmul');
     }
+    public function linear(Tensor $input, Tensor $weight, ?Tensor $bias = null): Tensor
+    {
+        throw $this->notImplemented('linear');
+    }
+    public function embeddingTokenIds(array $tokenIds, Shape $shape, Tensor $weight): Tensor
+    {
+        throw $this->notImplemented('embeddingTokenIds');
+    }
+    public function layerNorm(Tensor $input, Tensor $weight, Tensor $bias, float $epsilon = 1.0e-5): Tensor
+    {
+        throw $this->notImplemented('layerNorm');
+    }
     public function transpose(Tensor $tensor, ?int $axisA = null, ?int $axisB = null): Tensor
     {
         throw $this->notImplemented('transpose');

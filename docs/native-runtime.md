@@ -77,6 +77,54 @@ array PHP
 Cada operação retorna um novo handle proprietário; os inputs permanecem vivos e inalterados.
 `destroy()` libera um handle cedo, enquanto o destrutor PHP é a fallback.
 
+## Lifecycle residente para inferência repetida
+
+Pesos imutáveis devem ser convertidos para Tensor nativo uma vez durante o
+setup da instância que executará a inferência. Enquanto shape, dtype e conteúdo
+não mudarem, o mesmo Tensor pode participar de qualquer número de operações:
+
+```php
+$input = $backend->tensorFromFloat32($inputData, $inputShape);
+$weights = $backend->tensorFromFloat32($weightData, $weightShape);
+$residual = $backend->tensorFromFloat32($residualData, $residualShape);
+
+for ($iteration = 0; $iteration < $repetitions; ++$iteration) {
+    $projected = $input->matmul($weights);
+    $added = $projected->add($residual);
+    $normalized = $added->softmax();
+    $output = $normalized->transpose();
+
+    $projected->destroy();
+    $added->destroy();
+    $normalized->destroy();
+    // consumir ou destruir $output antes da próxima iteração
+}
+
+$input->destroy();
+$weights->destroy();
+$residual->destroy();
+```
+
+O objeto que representa o modelo ou serviço de inferência deve possuir os
+pesos. Ele os cria no setup, empresta-os imutavelmente durante `forward()` e os
+libera no teardown. Não existe registry global, singleton ou cache implícito.
+Destruir um conjunto não afeta outro conjunto criado pela mesma `NativeLibrary`.
+
+Inputs são diferentes de pesos. Se os dados de entrada mudam entre inferências,
+crie um novo Tensor de input para cada valor e mantenha apenas os pesos
+residentes. A API atual não oferece atualização in-place; não reutilize um input
+antigo para dados diferentes. O residual só deve ser residente quando for
+realmente constante para todas as chamadas.
+
+Uma falha de operação não consome os inputs. Outputs criados antes de uma
+exceção são liberados pelos destrutores PHP, e A/B/residual continuam válidos.
+Chamadas sequenciais na mesma instância e instâncias independentes são
+suportadas. Execução PHP concorrente sobre o mesmo objeto não possui contrato
+adicional nesta etapa; nenhum mutex ou paralelismo foi introduzido.
+
+Veja `examples/ffi/06-native-tensor-pipeline.php` para um lifecycle completo e
+executável. `TRANSFORMER_EXAMPLE_REPETITIONS` controla o número de inferências.
+
 A progressão implementada é:
 
 ```text
@@ -90,3 +138,44 @@ Futuros kernels incluem normalização, atenção, ativação, cache e quantiza�
 
 O 1D softmax de referência permanece disponível e está numericamente estável. A operação aditiva `transformer_tensor_softmax_last_dim` suporta tensores contínuos de rank-N
 e normaliza cada linha ao longo do último eixo em uma única chamada nativa.
+
+## Linear na última dimensão
+
+O símbolo aditivo `transformer_tensor_linear_last_dim` recebe input, weight e
+bias opcional como handles imutáveis. Input pode ter qualquer rank maior ou
+igual a um; weight é `[input_features, output_features]` e bias, quando presente,
+é `[output_features]`. O output preserva todas as dimensões anteriores e troca
+somente a última por `output_features`.
+
+No CPU, a operação reutiliza `matmul_dispatch_f32` com as dimensões anteriores
+achatadas conceitualmente em M e aplica bias diretamente por linha. O bias não
+é expandido nem copiado para o shape completo. Todos os inputs permanecem vivos
+e o output recebe um novo handle proprietário.
+
+## Embedding com IDs inteiros
+
+O símbolo aditivo `transformer_tensor_embedding` recebe um buffer temporário
+`int64_t` row-major para `[B,S]`, um weight residente Float32 `[V,D]` e publica
+um novo handle `[B,S,D]`. IDs são validados como `0 <= id < V` antes da cópia e
+só então convertidos de `i64` para `usize` no Rust.
+
+O kernel recebe exclusivamente slices seguros e copia
+`output[b,s,:] = weight[token_ids[b*S+s],:]`. Não existe Tensor inteiro,
+gather PHP ou Tensor intermediário. O weight permanece imutável e residente;
+o CData de IDs vive somente durante a chamada. `[0,S]`, `[B,0]` e `[0,0]`
+produzem outputs vazios com o shape completo e não acessam nenhuma linha.
+
+`Module` cobre introspecção e `TensorModule` cobre operações Tensor-to-Tensor.
+Por isso `Embedding` usa `forwardTokenIds()` sem representar IDs como Tensor
+Float32. O backend PurePHP declara o contrato, mas mantém o erro explícito de
+operação não implementada nesta etapa.
+
+## LayerNorm Tensor ABI
+
+`transformer_tensor_layer_norm(input, weight, bias, epsilon, output)` é uma
+extensão aditiva da ABI. Os três handles são emprestados e imutáveis; o output
+é um novo handle publicado apenas após validação e execução completas. A
+operação exige input rank-N com `N>=1`, última dimensão `D>0`, weight/bias
+rank-1 `[D]`, Float32 contíguo row-major e valores finitos. Panics são contidos
+na fronteira C. Shapes como `[0,D]`, `[B,0,D]` e `[0,0,D]` retornam Tensors
+vazios do mesmo shape sem executar Welford.

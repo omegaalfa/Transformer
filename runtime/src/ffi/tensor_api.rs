@@ -3,15 +3,23 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use crate::kernels::add::add_f32;
+use crate::kernels::embedding::embedding_f32;
+use crate::kernels::layer_norm::layer_norm_f32;
+use crate::kernels::linear::linear_last_dim_f32;
 use crate::kernels::matmul_dispatch::matmul_dispatch_f32;
 use crate::kernels::softmax::{softmax_f32, softmax_last_dim_f32};
 use crate::kernels::transpose::transpose_f32;
-use crate::tensor::{DType, Shape, Tensor};
+use crate::tensor::{DType, Shape, Strides, Tensor};
 
 use super::handle::TransformerTensor;
 use super::{STATUS_INSUFFICIENT_BUFFER, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PANIC};
 
 const DTYPE_FLOAT32: c_int = 0;
+
+#[cfg(test)]
+thread_local! {
+    static PANIC_LAYER_NORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Creates an exclusively owned native Float32 Tensor.
 ///
@@ -365,6 +373,251 @@ pub unsafe extern "C" fn transformer_tensor_matmul(
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Selects rows from a resident rank-2 Float32 embedding weight into a new
+/// owned Tensor with shape `[batch, sequence, embedding_dim]`.
+///
+/// # Safety
+///
+/// `weight` must point to a live handle and `output` must be writable for one
+/// handle pointer. For non-zero `batch * sequence`, `token_ids` must remain
+/// readable for that many `i64` elements during the call. Inputs remain alive
+/// and unchanged on success or error.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_tensor_embedding(
+    token_ids: *const i64,
+    batch: usize,
+    sequence: usize,
+    weight: *const TransformerTensor,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: `output` is non-null and writable by the caller contract.
+    unsafe { output.write(ptr::null_mut()) };
+
+    let Some(token_count) = batch.checked_mul(sequence) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if weight.is_null()
+        || token_count > isize::MAX as usize / size_of::<i64>()
+        || (token_count > 0 && token_ids.is_null())
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The caller guarantees a live immutable handle.
+        let weight = unsafe { &*weight }.tensor();
+        if weight.dtype() != DType::Float32 || weight.rank() != 2 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let weight_shape = weight.shape().as_slice();
+        let (vocab_size, embedding_dim) = (weight_shape[0], weight_shape[1]);
+        if vocab_size == 0 || embedding_dim == 0 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(output_length) = token_count.checked_mul(embedding_dim) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        if output_length > isize::MAX as usize / size_of::<f32>() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let token_ids = if token_count == 0 {
+            &[]
+        } else {
+            // SAFETY: Representable length and non-null pointer were checked;
+            // allocation validity remains the caller's responsibility.
+            unsafe { std::slice::from_raw_parts(token_ids, token_count) }
+        };
+        let Ok(shape) = Shape::new(vec![batch, sequence, embedding_dim]) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        if shape.numel() != output_length {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let mut values = vec![0.0; output_length];
+        if embedding_f32(
+            token_ids,
+            weight.as_slice(),
+            &mut values,
+            vocab_size,
+            embedding_dim,
+        )
+        .is_err()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+
+        let Ok(tensor) = Tensor::from_vec(values, shape) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
+        // SAFETY: `output` is valid by the caller contract and written once.
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Projects the last dimension of `input` using a resident rank-2 weight and
+/// an optional resident rank-1 bias, returning a new owned Tensor.
+///
+/// # Safety
+///
+/// Every non-null input must be a live handle for the complete call. `bias`
+/// may be null. `output` must be writable for one handle pointer and must not
+/// alias an input handle. Inputs remain alive and unchanged on success/error.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_tensor_linear_last_dim(
+    input: *const TransformerTensor,
+    weight: *const TransformerTensor,
+    bias: *const TransformerTensor,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: `output` is non-null and writable by the caller contract.
+    unsafe { output.write(ptr::null_mut()) };
+    if input.is_null() || weight.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Required pointers were checked and the caller guarantees live handles.
+        let input = unsafe { &*input }.tensor();
+        let weight = unsafe { &*weight }.tensor();
+        let bias = if bias.is_null() {
+            None
+        } else {
+            // SAFETY: A non-null optional bias is live by the caller contract.
+            Some(unsafe { &*bias }.tensor())
+        };
+        if input.dtype() != DType::Float32
+            || weight.dtype() != DType::Float32
+            || input.rank() < 1
+            || weight.rank() != 2
+            || bias.is_some_and(|tensor| tensor.dtype() != DType::Float32 || tensor.rank() != 1)
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let input_features = *input.shape().as_slice().last().unwrap_or(&0);
+        let weight_shape = weight.shape().as_slice();
+        let output_features = weight_shape[1];
+        if input_features != weight_shape[0]
+            || bias.is_some_and(|tensor| tensor.shape().as_slice() != [output_features])
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let mut dimensions = input.shape().as_slice().to_vec();
+        if let Some(last) = dimensions.last_mut() {
+            *last = output_features;
+        }
+        let Ok(shape) = Shape::new(dimensions) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let mut values = vec![0.0; shape.numel()];
+        if linear_last_dim_f32(
+            input.as_slice(),
+            weight.as_slice(),
+            bias.map(Tensor::as_slice),
+            &mut values,
+            input_features,
+            output_features,
+        )
+        .is_err()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Ok(tensor) = Tensor::from_vec(values, shape) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
+        // SAFETY: `output` is valid by the caller contract and written once.
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Applies inference LayerNorm over the last dimension into a new owned Tensor.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_tensor_layer_norm(
+    input: *const TransformerTensor,
+    weight: *const TransformerTensor,
+    bias: *const TransformerTensor,
+    epsilon: f32,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: `output` is non-null and writable by the caller contract.
+    unsafe { output.write(ptr::null_mut()) };
+    if input.is_null() || weight.is_null() || bias.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        PANIC_LAYER_NORM.with(|flag| {
+            if flag.replace(false) {
+                panic!("controlled LayerNorm ABI panic");
+            }
+        });
+        // SAFETY: Required pointers were checked and must remain live for this call.
+        let input = unsafe { &*input }.tensor();
+        let weight = unsafe { &*weight }.tensor();
+        let bias = unsafe { &*bias }.tensor();
+        if input.dtype() != DType::Float32
+            || weight.dtype() != DType::Float32
+            || bias.dtype() != DType::Float32
+            || input.rank() < 1
+            || weight.rank() != 1
+            || bias.rank() != 1
+            || !epsilon.is_finite()
+            || epsilon <= 0.0
+            || input.strides() != &Strides::contiguous(input.shape())
+            || weight.strides() != &Strides::contiguous(weight.shape())
+            || bias.strides() != &Strides::contiguous(bias.shape())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(&d) = input.shape().as_slice().last() else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        if d == 0 || weight.shape().as_slice() != [d] || bias.shape().as_slice() != [d] {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let shape = input.shape().clone();
+        let mut values = vec![0.0; input.numel()];
+        if layer_norm_f32(
+            input.as_slice(),
+            weight.as_slice(),
+            bias.as_slice(),
+            &mut values,
+            d,
+            epsilon,
+        )
+        .is_err()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Ok(tensor) = Tensor::from_vec(values, shape) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
+        // SAFETY: Publication happens exactly once after complete validation/execution.
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
 /// Materializes the transpose of a rank-2 Float32 Tensor.
 ///
 /// # Safety
@@ -534,6 +787,160 @@ mod tests {
     unsafe fn destroy(handle: *mut TransformerTensor) {
         // SAFETY: Test handles are destroyed exactly once.
         unsafe { transformer_tensor_destroy(handle) };
+    }
+
+    unsafe fn create(data: &[f32], shape: &[usize]) -> *mut TransformerTensor {
+        let mut handle = null_mut();
+        // SAFETY: Test slices match their declared shape and remain live for the call.
+        assert_eq!(
+            unsafe {
+                transformer_tensor_create_f32(
+                    data.as_ptr(),
+                    shape.as_ptr(),
+                    shape.len(),
+                    &mut handle,
+                )
+            },
+            STATUS_OK
+        );
+        handle
+    }
+
+    #[test]
+    fn tensor_linear_projects_last_dimension_and_preserves_inputs() {
+        // SAFETY: All handles are live and destroyed exactly once below.
+        unsafe {
+            let input = create(&[1.0, 2.0, 3.0, 4.0], &[2, 1, 2]);
+            let weight = create(&[1.0, -1.0, 2.0, 0.5, 3.0, 2.0], &[2, 3]);
+            let bias = create(&[0.25, -0.5, 1.0], &[3]);
+            let mut output = null_mut();
+            assert_eq!(
+                transformer_tensor_linear_last_dim(input, weight, bias, &mut output),
+                STATUS_OK
+            );
+            assert_eq!((*output).tensor().shape().as_slice(), &[2, 1, 3]);
+            assert_eq!(
+                (*output).tensor().as_slice(),
+                &[2.25, 4.5, 7.0, 5.25, 8.5, 15.0]
+            );
+            assert_eq!((*input).tensor().as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+            destroy(output);
+            destroy(bias);
+            destroy(weight);
+            destroy(input);
+        }
+    }
+
+    #[test]
+    fn tensor_embedding_gathers_batches_and_preserves_weight() {
+        // SAFETY: All buffers and handles are live and destroyed exactly once.
+        unsafe {
+            let weight_data = [0.0, 0.1, 0.2, 1.0, 1.1, 1.2, 2.0, 2.1, 2.2, 3.0, 3.1, 3.2];
+            let weight = create(&weight_data, &[4, 3]);
+            let ids = [3_i64, 0, 2, 1];
+            let mut output = null_mut();
+
+            assert_eq!(
+                transformer_tensor_embedding(ids.as_ptr(), 2, 2, weight, &mut output),
+                STATUS_OK
+            );
+            assert_eq!((*output).tensor().shape().as_slice(), &[2, 2, 3]);
+            assert_eq!(
+                (*output).tensor().as_slice(),
+                [3.0, 3.1, 3.2, 0.0, 0.1, 0.2, 2.0, 2.1, 2.2, 1.0, 1.1, 1.2]
+            );
+            assert_eq!((*weight).tensor().as_slice(), weight_data);
+
+            destroy(output);
+            destroy(weight);
+        }
+    }
+
+    #[test]
+    fn tensor_embedding_supports_all_approved_empty_shapes() {
+        // SAFETY: Empty inputs are never read and handles are destroyed once.
+        unsafe {
+            let weight = create(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+            for (batch, sequence) in [(0, 3), (2, 0), (0, 0)] {
+                let mut output = null_mut();
+                assert_eq!(
+                    transformer_tensor_embedding(null(), batch, sequence, weight, &mut output),
+                    STATUS_OK
+                );
+                assert_eq!((*output).tensor().shape().as_slice(), &[batch, sequence, 2]);
+                assert!((*output).tensor().is_empty());
+                destroy(output);
+            }
+            destroy(weight);
+        }
+    }
+
+    #[test]
+    fn tensor_embedding_rejects_ids_without_publishing_or_consuming_weight() {
+        // SAFETY: Inputs are valid for each call and the weight is destroyed once.
+        unsafe {
+            let weight = create(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+            for ids in [[0_i64, -1], [0_i64, 2]] {
+                let mut output = usize::MAX as *mut TransformerTensor;
+                assert_eq!(
+                    transformer_tensor_embedding(ids.as_ptr(), 1, 2, weight, &mut output),
+                    STATUS_INVALID_ARGUMENT
+                );
+                assert!(output.is_null());
+                assert_eq!((*weight).tensor().as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+            }
+
+            let valid = [1_i64];
+            let mut output = null_mut();
+            assert_eq!(
+                transformer_tensor_embedding(valid.as_ptr(), 1, 1, weight, &mut output),
+                STATUS_OK
+            );
+            destroy(output);
+            destroy(weight);
+        }
+    }
+
+    #[test]
+    fn tensor_embedding_rejects_invalid_metadata_and_overflow() {
+        // SAFETY: Invalid arguments are rejected before unsafe reads.
+        unsafe {
+            let rank_one_weight = create(&[1.0, 2.0], &[2]);
+            let mut output = usize::MAX as *mut TransformerTensor;
+            assert_eq!(
+                transformer_tensor_embedding(null(), 0, 1, rank_one_weight, &mut output),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert!(output.is_null());
+            assert_eq!(
+                transformer_tensor_embedding(null(), usize::MAX, 2, rank_one_weight, &mut output,),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert!(output.is_null());
+            assert_eq!(
+                transformer_tensor_embedding(null(), 1, 1, rank_one_weight, null_mut()),
+                STATUS_INVALID_ARGUMENT
+            );
+            destroy(rank_one_weight);
+        }
+    }
+
+    #[test]
+    fn tensor_linear_rejects_incompatible_shapes_without_consuming_inputs() {
+        // SAFETY: All handles are live and destroyed exactly once below.
+        unsafe {
+            let input = create(&[1.0, 2.0, 3.0], &[3]);
+            let weight = create(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+            let mut output = null_mut();
+            assert_eq!(
+                transformer_tensor_linear_last_dim(input, weight, null(), &mut output),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert!(output.is_null());
+            assert_eq!((*weight).tensor().as_slice(), &[1.0, 0.0, 0.0, 1.0]);
+            destroy(weight);
+            destroy(input);
+        }
     }
 
     #[test]
@@ -1733,5 +2140,81 @@ mod tests {
             unsafe { transformer_tensor_softmax(null(), null_mut()) },
             STATUS_INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn tensor_layer_norm_preserves_shape_and_publishes_only_on_success() {
+        let input = unsafe { create(&[-2.0, 0.0, 2.0, 4.0, 4.0, 4.0], &[2, 3]) };
+        let weight = unsafe { create(&[0.5, 2.0, -1.0], &[3]) };
+        let bias = unsafe { create(&[1.0, -2.0, 3.0], &[3]) };
+        let invalid = unsafe { create(&[f32::NAN, 0.0, 1.0], &[3]) };
+        let mut output = null_mut();
+        assert_eq!(
+            unsafe { transformer_tensor_layer_norm(input, weight, bias, 1e-5, &mut output) },
+            STATUS_OK
+        );
+        assert!(!output.is_null());
+        assert_eq!(unsafe { &*output }.tensor().shape().as_slice(), [2, 3]);
+        assert!(unsafe { &*output }
+            .tensor()
+            .as_slice()
+            .iter()
+            .all(|v| v.is_finite()));
+        unsafe { destroy(output) };
+
+        output = std::ptr::NonNull::<TransformerTensor>::dangling().as_ptr();
+        assert_eq!(
+            unsafe { transformer_tensor_layer_norm(invalid, weight, bias, 1e-5, &mut output) },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert!(output.is_null());
+        assert_eq!(
+            unsafe { transformer_tensor_layer_norm(input, weight, bias, 0.0, &mut output) },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert!(output.is_null());
+        for handle in [input, weight, bias, invalid] {
+            unsafe { destroy(handle) };
+        }
+    }
+
+    #[test]
+    fn tensor_layer_norm_supports_empty_outer_dimensions() {
+        for shape in [&[0, 3][..], &[2, 0, 3], &[0, 0, 3]] {
+            let input = unsafe { create(&[], shape) };
+            let weight = unsafe { create(&[1.0, 1.0, 1.0], &[3]) };
+            let bias = unsafe { create(&[0.0, 0.0, 0.0], &[3]) };
+            let mut output = null_mut();
+            assert_eq!(
+                unsafe { transformer_tensor_layer_norm(input, weight, bias, 1e-5, &mut output) },
+                STATUS_OK
+            );
+            assert_eq!(unsafe { &*output }.tensor().shape().as_slice(), shape);
+            assert!(unsafe { &*output }.tensor().is_empty());
+            for handle in [input, weight, bias, output] {
+                unsafe { destroy(handle) };
+            }
+        }
+    }
+
+    #[test]
+    fn tensor_layer_norm_contains_panics_and_recovers_for_next_call() {
+        let input = unsafe { create(&[1.0, 2.0], &[2]) };
+        let weight = unsafe { create(&[1.0, 1.0], &[2]) };
+        let bias = unsafe { create(&[0.0, 0.0], &[2]) };
+        let mut output = std::ptr::NonNull::<TransformerTensor>::dangling().as_ptr();
+        PANIC_LAYER_NORM.with(|flag| flag.set(true));
+        assert_eq!(
+            unsafe { transformer_tensor_layer_norm(input, weight, bias, 1e-5, &mut output) },
+            STATUS_PANIC
+        );
+        assert!(output.is_null());
+        assert_eq!(
+            unsafe { transformer_tensor_layer_norm(input, weight, bias, 1e-5, &mut output) },
+            STATUS_OK
+        );
+        for handle in [input, weight, bias, output] {
+            unsafe { destroy(handle) };
+        }
     }
 }

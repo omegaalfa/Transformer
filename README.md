@@ -318,10 +318,10 @@ FASE TENSOR
 FASE NN
   NN-R1  revisão arquitetural                 ✅ concluída
   NN-0   bridge PHP para Tensor nativo        ✅ concluída
-  NN-1   Parameter + Module                   ⬜
-  NN-2   Linear                               ⬜
-  NN-3   Embedding                            ⬜
-  NN-4   LayerNorm                            ⬜
+  NN-1   Parameter + Module                   ✅ concluída
+  NN-2   Linear                               ✅ concluída
+  NN-3   Embedding                            ✅ concluída
+  NN-4   LayerNorm                            ✅ concluída
   NN-5   GELU                                 ⬜
   NN-R2  revisão antes de Attention           ⬜
 
@@ -364,6 +364,13 @@ Não é necessário usar `phpize`, `configure` ou editar o `php.ini` nesta fase.
   `nm -D runtime/target/release/libtransformer_runtime.so`.
 - Se a biblioteca não for encontrada, confira o caminho calculado por
   `NativeLibrary::defaultPath()`.
+
+## LayerNorm nativo (NN-4)
+
+O módulo `LayerNorm` executa normalização de inferência sobre a última
+dimensão por meio do backend FFI, com gamma/beta residentes e `epsilon=1e-5`
+por default. O kernel usa Welford/Float64, produz um Tensor independente e
+rejeita shapes, epsilon ou valores não finitos antes de publicar o output.
 
 ## Licença
 

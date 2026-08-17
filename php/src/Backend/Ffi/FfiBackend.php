@@ -41,6 +41,51 @@ final class FfiBackend extends AbstractBackend
         return $left->matmul($right);
     }
 
+    public function linear(Tensor $input, Tensor $weight, ?Tensor $bias = null): Tensor
+    {
+        return $input->linear($weight, $bias);
+    }
+
+    public function layerNorm(Tensor $input, Tensor $weight, Tensor $bias, float $epsilon = 1.0e-5): Tensor
+    {
+        return $input->layerNorm($weight, $bias, $epsilon);
+    }
+
+    /** @param array<array-key, mixed> $tokenIds */
+    public function embeddingTokenIds(array $tokenIds, Shape $shape, Tensor $weight): Tensor
+    {
+        if (!array_is_list($tokenIds)) {
+            throw new InvalidArgumentException('Embedding token IDs must be a list.');
+        }
+        if (count($shape->dimensions) !== 2) {
+            throw new InvalidArgumentException('Embedding token shape must be rank 2 [batch, sequence].');
+        }
+        [$batch, $sequence] = $shape->dimensions;
+        if ($batch < 0 || $sequence < 0) {
+            throw new InvalidArgumentException('Embedding batch and sequence dimensions must be non-negative integers.');
+        }
+        $tokenCount = $this->checkedProduct($batch, $sequence, 'batch x sequence');
+        if (count($tokenIds) !== $tokenCount) {
+            throw new InvalidArgumentException('Embedding token count must equal batch x sequence.');
+        }
+
+        $weightShape = $weight->shape()->dimensions;
+        if (count($weightShape) !== 2 || $weightShape[0] <= 0 || $weightShape[1] <= 0) {
+            throw new InvalidArgumentException('Embedding weight must have shape [vocabulary_size, embedding_dim].');
+        }
+        $vocabularySize = $weightShape[0];
+        foreach ($tokenIds as $tokenId) {
+            if (!is_int($tokenId)) {
+                throw new InvalidArgumentException('Embedding token IDs must contain only integers.');
+            }
+            if ($tokenId < 0 || $tokenId >= $vocabularySize) {
+                throw new InvalidArgumentException('Embedding token ID is outside the vocabulary.');
+            }
+        }
+
+        return $this->nativeLibrary->embeddingTokenIds($tokenIds, $shape, $weight);
+    }
+
     public function add(Tensor $left, Tensor $right): Tensor
     {
         return $left->add($right);

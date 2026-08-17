@@ -4,6 +4,14 @@
 //! paths. It proves storage liveness from a topologically ordered DAG; it never
 //! infers ownership from native or PHP reference counts.
 
+#[path = "graph/execution.rs"]
+mod execution;
+
+#[allow(unused_imports)]
+pub(crate) use execution::{
+    execute, ExecutionError, ExecutionPlan, ExecutionResult, ExternalInputs, ExternalTensor,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ValueId(pub(crate) usize);
 
@@ -89,6 +97,7 @@ pub(crate) struct Graph {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GraphError {
+    InvalidGraph,
     InvalidValue,
     InvalidShape,
     IncompatibleShape,
@@ -234,12 +243,39 @@ impl GraphBuilder {
 
 impl Graph {
     pub(crate) fn analyze_lifetimes(&mut self) {
+        self.try_analyze_lifetimes()
+            .expect("GraphBuilder must produce a valid topological graph");
+    }
+
+    pub(crate) fn try_analyze_lifetimes(&mut self) -> Result<(), GraphError> {
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.id != NodeId(index) {
+                return Err(GraphError::InvalidGraph);
+            }
+            let output = self
+                .values
+                .get(node.output.0)
+                .ok_or(GraphError::InvalidGraph)?;
+            if output.producer != Some(node.id) {
+                return Err(GraphError::InvalidGraph);
+            }
+            for input in &node.inputs {
+                let input = self.values.get(input.0).ok_or(GraphError::InvalidGraph)?;
+                if input.producer.is_some_and(|producer| producer >= node.id) {
+                    return Err(GraphError::InvalidGraph);
+                }
+            }
+        }
         for value in &mut self.values {
             value.consumers.clear();
         }
         for node in &self.nodes {
             for input in &node.inputs {
-                self.values[input.0].consumers.push(node.id);
+                self.values
+                    .get_mut(input.0)
+                    .ok_or(GraphError::InvalidGraph)?
+                    .consumers
+                    .push(node.id);
             }
         }
         let graph_end = NodeId(self.nodes.len());
@@ -258,6 +294,7 @@ impl Graph {
                 value.producer.is_some() && !value.external_input && !value.external_output;
         }
         self.analyzed = true;
+        Ok(())
     }
 
     pub(crate) fn is_analyzed(&self) -> bool {
@@ -288,15 +325,19 @@ pub(crate) fn plan_storage(graph: &Graph) -> Result<StoragePlan, GraphError> {
     let mut assignments = vec![None; graph.values.len()];
 
     for value in graph.values.iter().filter(|value| value.producer.is_some()) {
-        let lifetime = value.lifetime.expect("produced values have lifetimes");
+        let lifetime = value.lifetime.ok_or(GraphError::InvalidGraph)?;
         let reusable_slot = slots.iter_mut().find(|slot| {
             slot.dtype == value.dtype
                 && slot.layout == value.layout
                 && slot.capacity_bytes >= value.bytes
                 && slot.values.iter().all(|assigned| {
-                    let other = graph.values[assigned.0]
-                        .lifetime
-                        .expect("assigned values have lifetimes");
+                    let Some(other) = graph
+                        .values
+                        .get(assigned.0)
+                        .and_then(|value| value.lifetime)
+                    else {
+                        return false;
+                    };
                     !lifetime.overlaps(other)
                 })
         });
@@ -328,6 +369,7 @@ pub(crate) struct PoolMetrics {
     pub(crate) bytes_allocated: usize,
     pub(crate) bytes_reused: usize,
     pub(crate) peak_live_bytes: usize,
+    pub(crate) peak_live_slots: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +383,7 @@ struct StoragePool<'a> {
     allocated: Vec<bool>,
     active: Vec<bool>,
     live_bytes: usize,
+    live_slots: usize,
     metrics: PoolMetrics,
 }
 
@@ -351,6 +394,7 @@ impl<'a> StoragePool<'a> {
             allocated: vec![false; plan.slots.len()],
             active: vec![false; plan.slots.len()],
             live_bytes: 0,
+            live_slots: 0,
             metrics: PoolMetrics::default(),
         }
     }
@@ -369,7 +413,9 @@ impl<'a> StoragePool<'a> {
         if !self.active[slot_id.0] {
             self.active[slot_id.0] = true;
             self.live_bytes += slot.capacity_bytes;
+            self.live_slots += 1;
             self.metrics.peak_live_bytes = self.metrics.peak_live_bytes.max(self.live_bytes);
+            self.metrics.peak_live_slots = self.metrics.peak_live_slots.max(self.live_slots);
         }
         reused
     }
@@ -380,6 +426,7 @@ impl<'a> StoragePool<'a> {
         }
         self.active[slot_id.0] = false;
         self.live_bytes -= self.plan.slots[slot_id.0].capacity_bytes;
+        self.live_slots -= 1;
         self.metrics.releases += 1;
         true
     }
@@ -389,12 +436,32 @@ pub(crate) fn simulate(graph: &Graph, plan: &StoragePlan) -> Result<Simulation, 
     if !graph.is_analyzed() {
         return Err(GraphError::GraphNotAnalyzed);
     }
+    if plan.assignments.len() != graph.values.len()
+        || plan
+            .slots
+            .iter()
+            .enumerate()
+            .any(|(index, slot)| slot.id != StorageSlotId(index))
+        || graph
+            .values
+            .iter()
+            .filter(|value| value.producer.is_some())
+            .any(|value| {
+                plan.assignments
+                    .get(value.id.0)
+                    .copied()
+                    .flatten()
+                    .map_or(true, |slot| slot.0 >= plan.slots.len())
+            })
+    {
+        return Err(GraphError::InvalidGraph);
+    }
     let mut pool = StoragePool::new(plan);
     let mut events = Vec::new();
 
     for node in &graph.nodes {
         let value = &graph.values[node.output.0];
-        let slot_id = plan.assignments[value.id.0].expect("node output has a slot");
+        let slot_id = plan.assignments[value.id.0].ok_or(GraphError::InvalidGraph)?;
         if pool.acquire(slot_id, value.bytes) {
             events.push(format!("node {} reuse slot {}", node.id.0, slot_id.0));
         } else {
@@ -624,5 +691,102 @@ mod tests {
         graph.analyze_lifetimes();
         let plan = plan_storage(&graph).unwrap();
         assert_ne!(plan.assignments[small.0], plan.assignments[large.0]);
+    }
+
+    #[test]
+    fn rejects_malformed_graphs_and_storage_plans_without_panicking() {
+        let (mut graph, _) = linear_graph();
+        graph.nodes[0].id = NodeId(7);
+        assert_eq!(graph.try_analyze_lifetimes(), Err(GraphError::InvalidGraph));
+
+        let (graph, _) = linear_graph();
+        let mut plan = plan_storage(&graph).unwrap();
+        plan.assignments.pop();
+        assert_eq!(simulate(&graph, &plan), Err(GraphError::InvalidGraph));
+    }
+
+    #[test]
+    fn analysis_planning_and_simulation_are_deterministic() {
+        let (expected_graph, _) = linear_graph();
+        let expected_plan = plan_storage(&expected_graph).unwrap();
+        let expected_simulation = simulate(&expected_graph, &expected_plan).unwrap();
+        for _ in 0..100 {
+            let (graph, _) = linear_graph();
+            let plan = plan_storage(&graph).unwrap();
+            assert_eq!(graph, expected_graph);
+            assert_eq!(plan, expected_plan);
+            assert_eq!(simulate(&graph, &plan).unwrap(), expected_simulation);
+        }
+    }
+
+    #[test]
+    fn lifetime_patterns_never_reuse_before_the_last_consumer() {
+        // C: a produced X feeds three independently ordered consumers.
+        let mut builder = GraphBuilder::new();
+        let source = input(&mut builder, &[2, 2]);
+        let x = builder
+            .operation(Operation::SoftmaxLastDim, &[source])
+            .unwrap();
+        let a = builder.operation(Operation::SoftmaxLastDim, &[x]).unwrap();
+        let b = builder.operation(Operation::Transpose, &[x]).unwrap();
+        let c = builder.operation(Operation::Transpose, &[x]).unwrap();
+        let mut graph = builder.build();
+        graph.analyze_lifetimes();
+        let plan = plan_storage(&graph).unwrap();
+        assert_eq!(graph.values[x.0].producer, Some(NodeId(0)));
+        assert_eq!(
+            graph.values[x.0].consumers,
+            vec![NodeId(1), NodeId(2), NodeId(3)]
+        );
+        assert_eq!(graph.values[x.0].consumer_count, 3);
+        assert_eq!(graph.values[x.0].last_use, Some(NodeId(3)));
+        assert_eq!(
+            graph.values[x.0].lifetime,
+            Some(Lifetime {
+                start: NodeId(0),
+                end: NodeId(3)
+            })
+        );
+        for consumer in [a, b, c] {
+            assert_ne!(plan.assignments[x.0], plan.assignments[consumer.0]);
+        }
+
+        // D: two independent sources converge at C.
+        let mut builder = GraphBuilder::new();
+        let x = input(&mut builder, &[2, 2]);
+        let y = input(&mut builder, &[2, 2]);
+        let a = builder.operation(Operation::SoftmaxLastDim, &[x]).unwrap();
+        let b = builder.operation(Operation::SoftmaxLastDim, &[y]).unwrap();
+        let c = builder.operation(Operation::Add, &[a, b]).unwrap();
+        let mut graph = builder.build();
+        graph.analyze_lifetimes();
+        let plan = plan_storage(&graph).unwrap();
+        assert_eq!(graph.values[a.0].consumers, vec![NodeId(2)]);
+        assert_eq!(graph.values[b.0].consumers, vec![NodeId(2)]);
+        assert_eq!(graph.values[a.0].last_use, Some(NodeId(2)));
+        assert_eq!(graph.values[b.0].last_use, Some(NodeId(2)));
+        assert_ne!(plan.assignments[a.0], plan.assignments[c.0]);
+        assert_ne!(plan.assignments[b.0], plan.assignments[c.0]);
+
+        // E: Y participates in A and a later independent C while A feeds B.
+        let mut builder = GraphBuilder::new();
+        let x = input(&mut builder, &[2, 2]);
+        let y = input(&mut builder, &[2, 2]);
+        let a = builder.operation(Operation::Add, &[x, y]).unwrap();
+        let b = builder.operation(Operation::SoftmaxLastDim, &[a]).unwrap();
+        let c = builder.operation(Operation::Add, &[y, y]).unwrap();
+        let mut graph = builder.build();
+        graph.analyze_lifetimes();
+        let plan = plan_storage(&graph).unwrap();
+        assert_eq!(
+            graph.values[y.0].consumers,
+            vec![NodeId(0), NodeId(2), NodeId(2)]
+        );
+        assert_eq!(graph.values[y.0].consumer_count, 3);
+        assert_eq!(graph.values[y.0].last_use, Some(NodeId(2)));
+        assert!(plan.assignments[y.0].is_none());
+        assert_eq!(graph.values[a.0].last_use, Some(NodeId(1)));
+        assert_ne!(plan.assignments[a.0], plan.assignments[b.0]);
+        assert_eq!(plan.assignments[a.0], plan.assignments[c.0]);
     }
 }

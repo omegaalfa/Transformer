@@ -156,6 +156,81 @@ final class NativeStorage implements StorageInterface
         return $this->binary('transformer_tensor_matmul', $other);
     }
 
+    public function linear(self $weight, ?self $bias = null): self
+    {
+        if ($this->ffi !== $weight->ffi || ($bias !== null && $this->ffi !== $bias->ffi)) {
+            throw new LogicException('Native tensors belong to different runtime instances.');
+        }
+
+        $output = $this->ffi->new('TransformerTensor *[1]');
+        $biasHandle = $bias?->handle();
+        $this->requireStatus(
+            // @phpstan-ignore method.notFound (Native methods are defined by FFI::cdef().)
+            $this->ffi->transformer_tensor_linear_last_dim(
+                $this->handle(),
+                $weight->handle(),
+                $biasHandle,
+                $output,
+            ),
+            'transformer_tensor_linear_last_dim',
+        );
+
+        return new self($this->ffi, $output[0]);
+    }
+
+    public function layerNorm(self $weight, self $bias, float $epsilon = 1.0e-5): self
+    {
+        if ($this->ffi !== $weight->ffi || $this->ffi !== $bias->ffi) {
+            throw new LogicException('Native tensors belong to different runtime instances.');
+        }
+
+        $output = $this->ffi->new('TransformerTensor *[1]');
+        $this->requireStatus(
+            // @phpstan-ignore method.notFound (Native methods are defined by FFI::cdef().)
+            $this->ffi->transformer_tensor_layer_norm(
+                $this->handle(),
+                $weight->handle(),
+                $bias->handle(),
+                $epsilon,
+                $output,
+            ),
+            'transformer_tensor_layer_norm',
+        );
+
+        return new self($this->ffi, $output[0]);
+    }
+
+    /**
+     * @internal Embedding IDs are copied to a temporary signed integer buffer.
+     * @param list<int> $tokenIds
+     */
+    public function embeddingTokenIds(array $tokenIds, int $batch, int $sequence, FFI $runtimeFfi): self
+    {
+        if ($this->ffi !== $runtimeFfi) {
+            throw new LogicException('Native tensor belongs to a different runtime instance.');
+        }
+
+        $tokenBuffer = $this->ffi->new('int64_t[' . max(1, count($tokenIds)) . ']');
+        foreach ($tokenIds as $index => $tokenId) {
+            // @phpstan-ignore offsetAccess.nonOffsetAccessible (FFI C array.)
+            $tokenBuffer[$index] = $tokenId;
+        }
+        $output = $this->ffi->new('TransformerTensor *[1]');
+        $this->requireStatus(
+            // @phpstan-ignore method.notFound (Native methods are defined by FFI::cdef().)
+            $this->ffi->transformer_tensor_embedding(
+                $tokenBuffer,
+                $batch,
+                $sequence,
+                $this->handle(),
+                $output,
+            ),
+            'transformer_tensor_embedding',
+        );
+
+        return new self($this->ffi, $output[0]);
+    }
+
     public function softmax(): self
     {
         return $this->unary('transformer_tensor_softmax');

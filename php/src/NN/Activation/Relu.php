@@ -9,6 +9,16 @@ use Omegaalfa\Transformer\Tensor\Tensor;
 
 final class Relu implements ActivationInterface
 {
+    public function parameters(): array
+    {
+        return [];
+    }
+
+    public function modules(): array
+    {
+        return [];
+    }
+
     public function forward(Tensor $input): Tensor
     {
         throw new LogicException('ReLU is not implemented yet.');

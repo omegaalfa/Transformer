@@ -7,9 +7,12 @@ namespace Omegaalfa\Transformer\Tests\Integration\Backend;
 use LogicException;
 use Omegaalfa\Transformer\Backend\Ffi\FfiBackend;
 use Omegaalfa\Transformer\Backend\Ffi\NativeLibrary;
+use Omegaalfa\Transformer\Exception\BackendException;
 use Omegaalfa\Transformer\Tensor\DType;
 use Omegaalfa\Transformer\Tensor\Device;
 use Omegaalfa\Transformer\Tensor\Shape;
+use Omegaalfa\Transformer\Tensor\Storage\NativeStorage;
+use Omegaalfa\Transformer\Tensor\Tensor;
 use PHPUnit\Framework\TestCase;
 
 final class NativeTensorTest extends TestCase
@@ -185,5 +188,114 @@ final class NativeTensorTest extends TestCase
         $result = $left->matmul($right)->add($residual)->transpose();
 
         self::assertSame([1.5, 3.5, 2.5, 4.5], $result->toFloat32());
+    }
+
+    public function testResidentInputsProduceBitwiseIdenticalSequentialResults(): void
+    {
+        $input = $this->backend->tensorFromFloat32([1, 2, 3, 4, 5, 6], new Shape([2, 3]));
+        $weight = $this->backend->tensorFromFloat32([1, 0, 0, 1, 1, 1], new Shape([3, 2]));
+        $residual = $this->backend->tensorFromFloat32([0.5, 0.5, 0.5, 0.5], new Shape([2, 2]));
+        $storageIds = [
+            spl_object_id($input->storage()),
+            spl_object_id($weight->storage()),
+            spl_object_id($residual->storage()),
+        ];
+
+        $expected = $this->residentPipeline($input, $weight, $residual)->toFloat32();
+        for ($iteration = 0; $iteration < 10; ++$iteration) {
+            self::assertSame(
+                $expected,
+                $this->residentPipeline($input, $weight, $residual)->toFloat32(),
+            );
+        }
+        self::assertSame($storageIds, [
+            spl_object_id($input->storage()),
+            spl_object_id($weight->storage()),
+            spl_object_id($residual->storage()),
+        ]);
+    }
+
+    public function testResidentFailureDoesNotInvalidateFollowingInference(): void
+    {
+        $input = $this->backend->tensorFromFloat32([1, 2, 3, 4, 5, 6], new Shape([2, 3]));
+        $weight = $this->backend->tensorFromFloat32([1, 0, 0, 1, 1, 1], new Shape([3, 2]));
+        $residual = $this->backend->tensorFromFloat32([0.5, 0.5, 0.5, 0.5], new Shape([2, 2]));
+        $wrongWeight = $this->backend->tensorFromFloat32([1, 2, 3, 4], new Shape([2, 2]));
+
+        try {
+            $input->matmul($wrongWeight);
+            self::fail('An incompatible resident weight must fail.');
+        } catch (BackendException) {
+            self::assertSame(
+                [0.5, 0.5, 0.5, 0.5],
+                $residual->toFloat32(),
+            );
+        }
+
+        self::assertSame(
+            $this->residentPipeline($input, $weight, $residual)->toFloat32(),
+            $this->residentPipeline($input, $weight, $residual)->toFloat32(),
+        );
+    }
+
+    public function testIndependentResidentSetsAndTeardownAreIsolated(): void
+    {
+        $inputA = $this->backend->tensorFromFloat32([1, 2, 3, 4], new Shape([2, 2]));
+        $weightA = $this->backend->tensorFromFloat32([1, 0, 0, 1], new Shape([2, 2]));
+        $residualA = $this->backend->tensorFromFloat32([0, 0, 0, 0], new Shape([2, 2]));
+        $inputB = $this->backend->tensorFromFloat32([4, 3, 2, 1], new Shape([2, 2]));
+        $weightB = $this->backend->tensorFromFloat32([2, 0, 0, 2], new Shape([2, 2]));
+        $residualB = $this->backend->tensorFromFloat32([1, 1, 1, 1], new Shape([2, 2]));
+
+        self::assertNotSame(spl_object_id($weightA->storage()), spl_object_id($weightB->storage()));
+        $expectedB = $this->residentPipeline($inputB, $weightB, $residualB)->toFloat32();
+        foreach ([$residualA, $weightA, $inputA] as $resident) {
+            $resident->destroy();
+        }
+
+        self::assertSame(
+            $expectedB,
+            $this->residentPipeline($inputB, $weightB, $residualB)->toFloat32(),
+        );
+        $weightAStorage = $weightA->storage();
+        $weightBStorage = $weightB->storage();
+        if (!$weightAStorage instanceof NativeStorage || !$weightBStorage instanceof NativeStorage) {
+            self::fail('Resident integration requires native storage.');
+        }
+        self::assertTrue($weightAStorage->isDestroyed());
+        self::assertFalse($weightBStorage->isDestroyed());
+    }
+
+    public function testReplacingResidentWeightExplicitlyReleasesThePreviousWeight(): void
+    {
+        $input = $this->backend->tensorFromFloat32([1, 2, 3, 4], new Shape([2, 2]));
+        $residual = $this->backend->tensorFromFloat32([0, 0, 0, 0], new Shape([2, 2]));
+        $weight = $this->backend->tensorFromFloat32([1, 0, 0, 1], new Shape([2, 2]));
+        $previousStorage = $weight->storage();
+        if (!$previousStorage instanceof NativeStorage) {
+            self::fail('Resident integration requires native storage.');
+        }
+        $weight->destroy();
+        $weight = $this->backend->tensorFromFloat32([2, 0, 0, 2], new Shape([2, 2]));
+
+        self::assertTrue($previousStorage->isDestroyed());
+        self::assertFalse($weight->storage() === $previousStorage);
+        self::assertCount(4, $this->residentPipeline($input, $weight, $residual)->toFloat32());
+    }
+
+    private function residentPipeline(
+        Tensor $input,
+        Tensor $weight,
+        Tensor $residual,
+    ): Tensor {
+        $projected = $input->matmul($weight);
+        $added = $projected->add($residual);
+        $normalized = $added->softmax();
+        $output = $normalized->transpose();
+        foreach ([$normalized, $added, $projected] as $temporary) {
+            $temporary->destroy();
+        }
+
+        return $output;
     }
 }

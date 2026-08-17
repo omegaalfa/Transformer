@@ -88,6 +88,20 @@ final readonly class NativeLibrary
         return new Tensor($storage->shape(), $storage);
     }
 
+    /** @param list<int> $tokenIds */
+    public function embeddingTokenIds(array $tokenIds, Shape $shape, Tensor $weight): Tensor
+    {
+        $storage = $weight->storage();
+        if (!$storage instanceof NativeStorage) {
+            throw new \LogicException('Embedding weight requires native storage.');
+        }
+
+        [$batch, $sequence] = $shape->dimensions;
+        $outputStorage = $storage->embeddingTokenIds($tokenIds, $batch, $sequence, $this->ffi);
+
+        return new Tensor($outputStorage->shape(), $outputStorage);
+    }
+
     /**
      * @param list<float> $a
      * @param list<float> $b

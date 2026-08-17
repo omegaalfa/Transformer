@@ -78,10 +78,10 @@ The NN architecture review is complete and did not add numerical code:
 
 - [x] **NN-R1** — Parameter, Module, PHP/Rust boundary, and dependency design.
 - [x] **NN-0** — high-level PHP bridge for native Tensor handles.
-- [ ] **NN-1** — Parameter and Module introspection contracts.
-- [ ] **NN-2** — Linear with native last-dimension projection and bias.
-- [ ] **NN-3** — Embedding with validated integer lookup.
-- [ ] **NN-4** — stable LayerNorm.
+- [x] **NN-1** — Parameter and Module introspection contracts.
+- [x] **NN-2** — Linear with native last-dimension projection and bias.
+- [x] **NN-3** — Embedding with validated integer lookup.
+- [x] **NN-4** — stable inference LayerNorm with resident gamma/beta.
 - [ ] **NN-5** — documented GELU variant and native operation.
 - [ ] **NN-R2** — architecture review before Attention.
 
