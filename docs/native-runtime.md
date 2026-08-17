@@ -207,3 +207,12 @@ Todos os handles de entrada são imutáveis e emprestados. O output começa nulo
 é publicado somente depois da execução completa e possui Storage independente.
 Panics retornam status de panic e não atravessam a ABI. A operação permanece
 CPU/Float32 e não se conecta ao Graph Executor experimental.
+
+## FeedForward e TransformerBlock sem ABI própria
+
+NN-7 não adiciona símbolos nativos. `FeedForward` compõe as ABIs existentes de
+Linear e GELU, enquanto `TransformerBlock` compõe LayerNorm,
+MultiHeadAttention, `Tensor::add()` e FeedForward em PHP. Os Tensors
+intermediários continuam residentes no runtime nativo e são liberados pelo
+lifecycle normal de `NativeStorage`; nenhuma lista PHP é materializada durante
+o forward. Não existem kernels fused ou nós novos no Graph Executor.

@@ -9,3 +9,4 @@
 *.dylib
 compile_commands.json
 .aider*
+composer.lock

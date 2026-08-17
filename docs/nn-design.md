@@ -198,6 +198,8 @@ NN-4   LayerNorm estável                                                   COMP
 NN-5   GELU tanh                                                          COMPLETO
 NN-R2  revisão antes da atenção                                          COMPLETO
 NN-6   MultiHeadAttention não causal                                     COMPLETO
+NN-R3  revisão antes do TransformerBlock                                 COMPLETO
+NN-7   FeedForward e TransformerBlock Pre-Norm                           COMPLETO
 ```
 
 Cada portão de implementação requer sua própria aprovação, testes e atualização de documentação.
@@ -279,3 +281,33 @@ módulo. A referência PHP usa doubles; no caso controlado com e sem máscara, o
 máximos observados foram `1.034e-7` absoluto e `9.528e-7` relativo. O gate usa
 `atol=1e-5` e `rtol=1e-5`, conservadores para os casos cobertos e sem promessa
 de paridade bitwise.
+
+## NN-7 — FeedForward e TransformerBlock Pre-Norm
+
+`FeedForward` é um `Module` composto por três módulos residentes, expostos
+nesta ordem por `modules()`: `input_projection`, `activation` e
+`output_projection`. A primeira `Linear` executa `D -> I` com weight `[D,I]`
+e bias `[I]`; a ativação é obrigatoriamente a `Gelu` tanh de NN-5; a segunda
+`Linear` executa `I -> D` com weight `[I,D]` e bias `[D]`. `D` é
+`hiddenSize`, `I` é `intermediateSize`, e nenhuma projeção biasless ou ativação
+configurável faz parte deste gate.
+
+`TransformerBlock` é um `Module`, não um `TensorModule`, porque seu forward
+recebe `?AttentionMask`. Ele possui exatamente `norm1`, `attention`, `norm2` e
+`feed_forward`, nessa ordem pública, e executa Pre-Norm:
+
+```text
+a = input + attention(norm1(input), mask)
+output = a + feed_forward(norm2(a))
+```
+
+Os residuals usam `Tensor::add()` estrito com shapes idênticos e sem
+broadcasting. A máscara `[B,S]` é temporária e alcança somente Attention.
+Inputs e outputs são `[B,S,D]`; `[0,S,D]`, `[B,0,D]` e `[0,0,D]` são válidos
+quando `D>0`. Parameters permanecem nos módulos folha; Block e FeedForward
+retornam `parameters()=[]` e não armazenam inputs, outputs ou temporários.
+
+A composição ocorre integralmente em PHP sobre Tensors nativos residentes.
+Não existem ABI ou kernel fused de FeedForward/TransformerBlock, integração ao
+Graph Executor, dropout, causalidade, RoPE, positional encoding ou GPU neste
+gate.

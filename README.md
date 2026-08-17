@@ -325,13 +325,15 @@ FASE NN
   NN-5   GELU tanh                            ✅ concluída
   NN-R2  revisão antes de Attention           ✅ concluída
   NN-6   MultiHeadAttention não causal        ✅ concluída
+  NN-R3  revisão antes de TransformerBlock    ✅ concluída
+  NN-7   FeedForward + TransformerBlock       ✅ concluída
 
 FASE TRANSFORMER
   Q / K / V                                   ✅ concluída
   Self-Attention                              ✅ concluída via MultiHeadAttention
   Multi-Head Attention                        ✅ concluída
-  Feed Forward                                ⬜
-  Residual + TransformerBlock                 ⬜
+  Feed Forward                                ✅ concluída
+  Residual + TransformerBlock                 ✅ concluída
 
 MODELO REAL
   tokenizer e vocabulário                     ⬜
@@ -388,6 +390,18 @@ value object booleano `[B,S]`: `true` permite uma key e `false` a exclui do
 softmax estável. A operação dedicada permanece totalmente nativa, retorna um
 Tensor `[B,S,D]` independente e não adiciona reshape, permute, Tensor booleano,
 RoPE, KV cache, dropout, GPU ou integração ao Graph Executor.
+
+## FeedForward e TransformerBlock (NN-7)
+
+`FeedForward` compõe duas `Linear` residentes com bias e a `Gelu` tanh:
+`[D,I] + [I]`, ativação, então `[I,D] + [D]`. `TransformerBlock` executa
+Pre-Norm como `a = x + Attention(LN1(x), mask)` e
+`y = a + FeedForward(LN2(a))`. A máscara alcança somente Attention e os
+residuals usam soma estrita, sem broadcasting.
+
+Ambos são composição PHP sobre Tensors nativos residentes. Não foram criados
+ABI, kernel fused, integração ao Graph Executor, dropout, RoPE, causalidade ou
+suporte GPU nesta etapa.
 
 ## Licença
 
