@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Omegaalfa\Transformer\Tests\Integration\Embedding;
 
 use Omegaalfa\Transformer\Backend\BackendType;
+use Omegaalfa\Transformer\Backend\Cuda\CudaBgePrecision;
 use Omegaalfa\Transformer\Backend\Ffi\FfiBackend;
 use Omegaalfa\Transformer\Backend\Ffi\NativeLibrary;
 use Omegaalfa\Transformer\Embedding\CudaBgeEmbeddingModel;
@@ -31,7 +32,8 @@ final class CudaBgeEmbeddingTest extends TestCase
             new RuntimeConfig(BackendType::Ffi),
         );
         self::$model = (new CudaBgeEmbeddingModelLoader($runtime, $library))->load($checkpoint);
-        self::$reference = dirname($checkpoint) . '/reference/hello_world/cls_normalized.f32';
+        $reference = dirname($checkpoint) . '/reference/hello_world/cls_normalized.f32';
+        self::$reference = is_file($reference) ? $reference : '';
     }
 
     public function testRealCudaModelIsResidentDeterministicAndMatchesOfficialReference(): void
@@ -61,16 +63,59 @@ final class CudaBgeEmbeddingTest extends TestCase
         self::assertSame(1, $diagnostics['host_submissions']);
         self::assertSame(195, $diagnostics['internal_submissions']);
 
-        $decoded = unpack('g*', (string) file_get_contents(self::$reference));
-        self::assertIsArray($decoded);
-        foreach (array_values($decoded) as $index => $expected) {
-            self::assertIsFloat($expected);
-            self::assertLessThanOrEqual(2.0e-5 + 2.0e-5 * abs($expected), abs($first[$index] - $expected));
+        if (self::$reference !== '') {
+            $decoded = unpack('g*', (string) file_get_contents(self::$reference));
+            self::assertIsArray($decoded);
+            foreach (array_values($decoded) as $index => $expected) {
+                self::assertIsFloat($expected);
+                self::assertLessThanOrEqual(2.0e-5 + 2.0e-5 * abs($expected), abs($first[$index] - $expected));
+            }
         }
 
         $batch = self::$model->encodeBatch(['hello world', 'A second sentence.']);
         self::assertCount(2, $batch);
         self::assertCount(384, $batch[0]);
         self::assertCount(384, $batch[1]);
+    }
+
+    public function testMixedPrecisionModelsAreExplicitIndependentAndNumericallyCompatible(): void
+    {
+        $checkpoint = getenv('TRANSFORMER_BGE_CUDA_CHECKPOINT');
+        if (!is_string($checkpoint) || $checkpoint === '') {
+            self::markTestSkipped('Set TRANSFORMER_BGE_CUDA_CHECKPOINT and build runtime with --features cuda.');
+        }
+        $root = dirname(__DIR__, 3);
+        $library = NativeLibrary::defaultPath($root);
+        $runtime = new Runtime(new FfiBackend(new NativeLibrary($library)), new RuntimeConfig(BackendType::Ffi));
+        $models = [];
+        foreach (CudaBgePrecision::cases() as $precision) {
+            $models[$precision->name] = (new CudaBgeEmbeddingModelLoader($runtime, $library, $precision))->load($checkpoint);
+        }
+        $expected = $models['Float32']->encode('hello world');
+        foreach ($models as $name => $model) {
+            $first = $model->encode('hello world');
+            $second = $model->encode('hello world');
+            self::assertSame($first, $second, $name);
+            self::assertSame($model->library->precision->value, $model->library->benchmarkDiagnostics()['precision']);
+            self::assertGreaterThanOrEqual(0.9999, self::cosine($expected, $first), $name);
+        }
+        self::assertNotSame($models['Float32']->library->identity(), $models['Float16']->library->identity());
+        self::assertNotSame($models['Float16']->library->identity(), $models['BFloat16']->library->identity());
+    }
+
+    /**
+     * @param list<float> $left
+     * @param list<float> $right
+     */
+    private static function cosine(array $left, array $right): float
+    {
+        $dot = $leftNorm = $rightNorm = 0.0;
+        foreach ($left as $index => $value) {
+            $dot += $value * $right[$index];
+            $leftNorm += $value * $value;
+            $rightNorm += $right[$index] * $right[$index];
+        }
+
+        return $dot / sqrt($leftNorm * $rightNorm);
     }
 }

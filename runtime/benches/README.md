@@ -36,6 +36,31 @@ explicit stream synchronization occurs at final D2H. TF32 and cuBLAS batched
 attention were measured and rejected; strict FP32 and specialized attention
 remain production defaults.
 
+GPU-R4 compares explicit FP32, FP16 and BF16 resident model instances over the
+public API (100 warmups and at least 100 samples per shape):
+
+```bash
+cargo build --release --manifest-path runtime/Cargo.toml --features cuda
+TRANSFORMER_BGE_CUDA_CHECKPOINT=/path/to/bge-small-en-v1.5 \
+TRANSFORMER_BGE_MIXED_WARMUPS=100 \
+TRANSFORMER_BGE_MIXED_SAMPLES=100 \
+php -d xdebug.mode=off runtime/benches/bge_cuda_mixed.php
+
+TRANSFORMER_BGE_CUDA_CHECKPOINT=/path/to/bge-small-en-v1.5 \
+php -d xdebug.mode=off runtime/benches/bge_cuda_mixed_soak.php
+
+TRANSFORMER_BGE_CUDA_CHECKPOINT=/path/to/bge-small-en-v1.5 \
+TRANSFORMER_BGE_HARDENING_ITERATIONS=2000 \
+php -d xdebug.mode=off runtime/benches/bge_cuda_mixed_hardening.php
+```
+
+The matrix reports p50/p95/p99/mean/stddev, sentences/s, tokens/s, CUDA device
+time, FP32 parity and resident parameter/workspace bytes. The hardening runner
+compares embedding LayerNorm plus all 12 block outputs, and scans every logical
+mixed-precision stage on device without copying full intermediates during the
+soak. FP16 and BF16 pass the final opt-in gate; FP32 remains the default and no
+automatic precision selection is performed.
+
 ## MODEL-R5 BGE end-to-end benchmark
 
 `bge_embedding.php` measures the public sentence-to-embedding path in one PHP

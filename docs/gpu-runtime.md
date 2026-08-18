@@ -97,6 +97,33 @@ The CPU runtime above is used only by the existing validated Safetensors
 materializer during model construction. Forward execution uses the CUDA handle
 owned by `CudaBgeEmbeddingModel`.
 
+### Explicit precision modes
+
+FP32 remains the compatibility default. GPU-R4 adds opt-in FP16 and BF16 model
+instances; precision belongs to the model at construction and cannot change
+during a forward. Each instance converts and uploads the 197 parameters once,
+keeps only the selected representation in VRAM, uses FP32 accumulation for
+GEMMs and attention, and returns the same public Float32 `[B,384]` embedding.
+
+```php
+use Omegaalfa\Transformer\Backend\Cuda\CudaBgePrecision;
+
+$model = (new CudaBgeEmbeddingModelLoader(
+    $runtime,
+    $library,
+    CudaBgePrecision::Float16,
+))->load('/path/to/bge-small-en-v1.5');
+
+$embedding = $model->encode('How do I request annual leave?');
+```
+
+`Float16` is the accepted performance mode on the validation RTX 3060. It
+halves resident parameter bytes (`132,848,640 -> 66,424,320`) and approximately
+halves activation workspace. `BFloat16` remains explicitly selectable for
+experimentation, but was not accepted as the recommended mode because it was
+slower and less accurate than FP16 on this host. Selecting one mode never
+silently falls back to another.
+
 ## Validation result
 
 On an RTX 3060 with CUDA 12, the real checkpoint loaded all 197 parameters.
@@ -200,3 +227,39 @@ Na RTX 3060 usada para o gate, o baseline `PUBLIC BGE CUDA WARM ENCODE` mediu
 p50/p95. O soak de shape constante manteve a VRAM idêntica; crescer de S=4
 para a sequência longa reservou 4 MiB uma única vez e as repetições seguintes
 tiveram delta zero.
+
+## GPU-R4: mixed precision
+
+The mixed path retains the GPU-R3 CUDA Graph boundary: integer inputs cross H2D
+once, all embeddings and 12 blocks remain resident, and only normalized
+Float32 embeddings cross D2H. FP16/BF16 parameters and activations use 16-bit
+storage; GEMM and attention accumulation, softmax, LayerNorm reduction,
+ExactGELU evaluation and final L2 reduction remain FP32 or wider.
+
+GPU-R4.1 found and fixed a shared-memory race in attention softmax: the first
+reduction slot held the maximum and could be overwritten by the sum reduction
+before every warp had consumed it. A dedicated shared maximum now separates
+the two reductions. Before the fix, B=8/S=82 produced isolated `+Inf` first in
+layer-11 softmax with Graph both on and off. After the fix, 2,000 instrumented
+forwards in each FP16/BF16 and Graph on/off combination produced zero NaN/Inf,
+zero drift, and bitwise-identical outputs.
+
+The final controlled run used 100 warmups and 100 public `encodeBatch()`
+samples per case. FP32 -> FP16 p50 results were `2.258 -> 1.940 ms` for B=1/S=4
+(`1.164x`), `6.025 -> 4.283 ms` for B=1/S=82 (`1.407x`),
+`9.256 -> 5.336 ms` for B=32/S=4 (`1.735x`), and `42.772 -> 32.488 ms` for
+B=32/S=32 (`1.317x`). B=8/S=82 measured `29.683 -> 26.145 ms` (`1.135x`).
+BF16 measured `5.525 ms` at B=32/S=4 (`1.675x`) and `32.566 ms` at B=32/S=32
+(`1.313x`). Semantic ranking remained unchanged for both modes.
+
+The 13 captured states comprise embedding LayerNorm and the output of every
+Transformer block. Their worst cosine was `0.9999995997` for FP16 and
+`0.9999420599` for BF16. Final normalized embedding cosine remained at least
+`0.9999995668` for FP16 and `0.9999516027` for BF16 in the measured matrix.
+FP16 and BF16 each retained 66,424,320 resident parameter bytes versus
+132,848,640 for FP32. A 1,000-forward B=1/S=4 soak and a 100-forward B=8/S=82
+soak were bitwise deterministic and had zero VRAM delta in both modes.
+
+FP16 and BF16 are accepted explicit opt-in modes. FP32 remains the default;
+applications must select a mixed mode deliberately after accepting its
+numerical accuracy contract.

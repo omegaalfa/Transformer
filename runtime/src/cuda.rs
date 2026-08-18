@@ -2,10 +2,14 @@ use std::ffi::{c_int, c_void};
 
 pub const CUDA_BGE_MATH_FP32: c_int = 0;
 pub const CUDA_BGE_MATH_TF32: c_int = 1;
+pub const CUDA_BGE_PRECISION_FP32: c_int = 0;
+pub const CUDA_BGE_PRECISION_FP16: c_int = 1;
+pub const CUDA_BGE_PRECISION_BF16: c_int = 2;
 
 extern "C" {
     fn cuda_bge_available_impl() -> c_int;
     fn cuda_bge_create_impl() -> *mut c_void;
+    fn cuda_bge_create_precision_impl(precision: c_int) -> *mut c_void;
     fn cuda_bge_set_parameter_impl(
         handle: *mut c_void,
         index: c_int,
@@ -46,6 +50,18 @@ extern "C" {
         output: *mut f32,
         phases: *mut f32,
     ) -> c_int;
+    fn cuda_bge_diagnose_impl(
+        handle: *mut c_void,
+        ids: *const i64,
+        mask: *const u8,
+        types: *const i64,
+        batch: c_int,
+        sequence: c_int,
+        snapshots: *mut f32,
+        snapshot_count: usize,
+        metadata: *mut u64,
+        invalid_value: *mut f32,
+    ) -> c_int;
     fn cuda_bge_destroy_impl(handle: *mut c_void);
     fn cuda_bge_memory_info_impl(free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
     fn cuda_bge_diagnostics_impl(handle: *mut c_void, values: *mut u64, capacity: usize) -> c_int;
@@ -58,6 +74,19 @@ pub extern "C" fn transformer_cuda_available() -> c_int {
 #[no_mangle]
 pub extern "C" fn transformer_cuda_bge_create() -> *mut c_void {
     unsafe { cuda_bge_create_impl() }
+}
+#[no_mangle]
+pub extern "C" fn transformer_cuda_bge_create_precision(precision: c_int) -> *mut c_void {
+    if ![
+        CUDA_BGE_PRECISION_FP32,
+        CUDA_BGE_PRECISION_FP16,
+        CUDA_BGE_PRECISION_BF16,
+    ]
+    .contains(&precision)
+    {
+        return std::ptr::null_mut();
+    }
+    unsafe { cuda_bge_create_precision_impl(precision) }
 }
 /// # Safety
 /// `handle` must be a live CUDA BGE handle and `data` must address `count`
@@ -165,6 +194,38 @@ pub unsafe extern "C" fn transformer_cuda_bge_forward_detailed(
     }
 }
 /// # Safety
+/// Internal benchmark ABI. Inputs must match `[batch, sequence]`; `snapshots`
+/// must hold `13 * batch * sequence * 384` Float32 values, `metadata` four
+/// writable `u64` values, and `invalid_value` one writable Float32 value.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_cuda_bge_diagnose(
+    handle: *mut c_void,
+    ids: *const i64,
+    mask: *const u8,
+    types: *const i64,
+    batch: c_int,
+    sequence: c_int,
+    snapshots: *mut f32,
+    snapshot_count: usize,
+    metadata: *mut u64,
+    invalid_value: *mut f32,
+) -> c_int {
+    unsafe {
+        cuda_bge_diagnose_impl(
+            handle,
+            ids,
+            mask,
+            types,
+            batch,
+            sequence,
+            snapshots,
+            snapshot_count,
+            metadata,
+            invalid_value,
+        )
+    }
+}
+/// # Safety
 /// `handle` must be null or a live handle that has not previously been destroyed.
 #[no_mangle]
 pub unsafe extern "C" fn transformer_cuda_bge_destroy(handle: *mut c_void) {
@@ -182,7 +243,7 @@ pub unsafe extern "C" fn transformer_cuda_memory_info(
 }
 
 /// # Safety
-/// `handle` must be live and `values` must address at least eighteen writable
+/// `handle` must be live and `values` must address at least twenty-three writable
 /// `u64` entries. This diagnostic ABI is intended for internal benchmarks.
 #[no_mangle]
 pub unsafe extern "C" fn transformer_cuda_bge_diagnostics(

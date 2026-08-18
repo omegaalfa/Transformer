@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Omegaalfa\Transformer\Model\Loader;
 
 use Omegaalfa\Transformer\Backend\Cuda\CudaBgeLibrary;
+use Omegaalfa\Transformer\Backend\Cuda\CudaBgePrecision;
 use Omegaalfa\Transformer\Embedding\CudaBgeEmbeddingModel;
 use Omegaalfa\Transformer\Model\Encoder\Bert\BertConfigReader;
 use Omegaalfa\Transformer\Runtime\Runtime;
@@ -13,8 +14,11 @@ use Omegaalfa\Transformer\Tokenizer\BertTokenizer;
 
 final readonly class CudaBgeEmbeddingModelLoader
 {
-    public function __construct(private Runtime $cpuRuntime, private string $cudaLibraryPath)
-    {
+    public function __construct(
+        private Runtime $cpuRuntime,
+        private string $cudaLibraryPath,
+        private CudaBgePrecision $precision = CudaBgePrecision::Float32,
+    ) {
     }
 
     public function load(string $directory): CudaBgeEmbeddingModel
@@ -48,7 +52,7 @@ final readonly class CudaBgeEmbeddingModelLoader
         ))->load($directory . '/model.safetensors');
         $timings['decode_materialize'] = (hrtime(true) - $start) / 1_000.0;
         $start = hrtime(true);
-        $cuda = new CudaBgeLibrary($this->cudaLibraryPath);
+        $cuda = new CudaBgeLibrary($this->cudaLibraryPath, $this->precision);
         $timings['cuda_context_cublas'] = (hrtime(true) - $start) / 1_000.0;
         try {
             $copyoutUs = $uploadUs = 0.0;

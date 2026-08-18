@@ -14,11 +14,12 @@ final class CudaBgeLibrary
     private mixed $handle;
     private int $parameterCount = 0;
 
-    public function __construct(string $libraryPath)
+    public function __construct(string $libraryPath, public readonly CudaBgePrecision $precision = CudaBgePrecision::Float32)
     {
         $this->ffi = FFI::cdef(<<<'CDEF'
             int transformer_cuda_available(void);
             void *transformer_cuda_bge_create(void);
+            void *transformer_cuda_bge_create_precision(int precision);
             int transformer_cuda_bge_set_parameter(void *handle, int index, const float *data, size_t count);
             int transformer_cuda_bge_finalize(void *handle);
             int transformer_cuda_bge_set_math_mode(void *handle, int mode);
@@ -30,6 +31,9 @@ final class CudaBgeLibrary
                 int timing_capacity, int *timing_count);
             int transformer_cuda_bge_forward_detailed(void *handle, const int64_t *ids, const uint8_t *mask,
                 const int64_t *types, int batch, int sequence, float *output, float *phases);
+            int transformer_cuda_bge_diagnose(void *handle, const int64_t *ids, const uint8_t *mask,
+                const int64_t *types, int batch, int sequence, float *snapshots, size_t snapshot_count,
+                uint64_t *metadata, float *invalid_value);
             int transformer_cuda_bge_diagnostics(void *handle, uint64_t *values, size_t capacity);
             void transformer_cuda_bge_destroy(void *handle);
             int transformer_cuda_memory_info(size_t *free_bytes, size_t *total_bytes);
@@ -37,7 +41,7 @@ final class CudaBgeLibrary
         if ($this->invoke('transformer_cuda_available') !== 1) {
             throw new BackendException('CUDA device is unavailable.');
         }
-        $handle = $this->invoke('transformer_cuda_bge_create');
+        $handle = $this->invoke('transformer_cuda_bge_create_precision', $precision->value);
         if (!$handle instanceof CData || FFI::isNull($handle)) {
             throw new BackendException('CUDA BGE model allocation failed.');
         }
@@ -121,12 +125,12 @@ final class CudaBgeLibrary
     /** @return array<string, int|bool> */
     public function benchmarkDiagnostics(): array
     {
-        $buffer = $this->buffer('uint64_t[18]');
-        if ($this->invoke('transformer_cuda_bge_diagnostics', $this->handle(), $buffer, 18) !== 0) {
+        $buffer = $this->buffer('uint64_t[23]');
+        if ($this->invoke('transformer_cuda_bge_diagnostics', $this->handle(), $buffer, 23) !== 0) {
             throw new BackendException('CUDA BGE diagnostics failed.');
         }
-        $decoded = unpack('P*', FFI::string($buffer, 18 * 8));
-        if ($decoded === false || count($decoded) !== 18) {
+        $decoded = unpack('P*', FFI::string($buffer, 23 * 8));
+        if ($decoded === false || count($decoded) !== 23) {
             throw new BackendException('CUDA BGE diagnostics are malformed.');
         }
         $values = [];
@@ -147,7 +151,145 @@ final class CudaBgeLibrary
             'batch' => $values[12], 'sequence' => $values[13],
             'graph_enabled' => $values[14] === 1, 'graph_captured' => $values[15] === 1,
             'graph_reused' => $values[16] === 1, 'graph_ready' => $values[17] === 1,
+            'parameter_bytes' => $values[18], 'workspace_bytes' => $values[19],
+            'precision' => $values[20],
+            'parameter_conversion_ns' => $values[21], 'parameter_upload_ns' => $values[22],
         ];
+    }
+
+    /** Internal mixed-precision validation; never used by public forward.
+     * @param list<int> $ids
+     * @param list<bool> $mask
+     * @param list<int> $types
+     * @return array{states: list<list<float>>, invalid: array{category: int, stage: int, layer: int, index: int, value: float}}
+     */
+    public function benchmarkStates(array $ids, array $mask, array $types, int $batch, int $sequence): array
+    {
+        $count = $batch * $sequence;
+        if ($batch < 1 || $sequence < 1 || count($ids) !== $count || count($mask) !== $count || count($types) !== $count) {
+            throw new BackendException('CUDA diagnostic input must match [B,S].');
+        }
+        $idBuffer = $this->buffer("int64_t[{$count}]");
+        $maskBuffer = $this->buffer("uint8_t[{$count}]");
+        $typeBuffer = $this->buffer("int64_t[{$count}]");
+        $packedIds = pack('q*', ...$ids);
+        $packedTypes = pack('q*', ...$types);
+        $packedMask = pack('C*', ...array_map(static fn ($value): int => $value ? 1 : 0, $mask));
+        FFI::memcpy($idBuffer, $packedIds, strlen($packedIds));
+        FFI::memcpy($typeBuffer, $packedTypes, strlen($packedTypes));
+        FFI::memcpy($maskBuffer, $packedMask, strlen($packedMask));
+        $stateSize = $count * 384;
+        $snapshotCount = 13 * $stateSize;
+        $snapshots = $this->buffer("float[{$snapshotCount}]");
+        $metadata = $this->buffer('uint64_t[4]');
+        $invalidValue = $this->buffer('float[1]');
+        if ($this->invoke('transformer_cuda_bge_diagnose', $this->handle(), $idBuffer, $maskBuffer, $typeBuffer, $batch, $sequence, $snapshots, $snapshotCount, $metadata, $invalidValue) !== 0) {
+            throw new BackendException('CUDA mixed-precision diagnostic failed.');
+        }
+        $snapshotBytes = $this->checkedBytes($snapshotCount, 4);
+        $decoded = unpack('g*', FFI::string($snapshots, $snapshotBytes));
+        $decodedMetadata = unpack('P*', FFI::string($metadata, 32));
+        $decodedInvalid = unpack('gvalue', FFI::string($invalidValue, 4));
+        if ($decoded === false || $decodedMetadata === false || $decodedInvalid === false) {
+            throw new BackendException('CUDA mixed-precision diagnostic is malformed.');
+        }
+        $values = [];
+        foreach ($decoded as $value) {
+            if (!is_float($value)) {
+                throw new BackendException('CUDA mixed-precision snapshot is malformed.');
+            }
+            $values[] = $value;
+        }
+        $states = [];
+        for ($state = 0; $state < 13; ++$state) {
+            $states[] = array_slice($values, $state * $stateSize, $stateSize);
+        }
+        $meta = $this->decodeDiagnosticMetadata($decodedMetadata);
+        $invalid = $decodedInvalid['value'];
+        if (!is_float($invalid)) {
+            throw new BackendException('CUDA mixed-precision invalid value is malformed.');
+        }
+
+        return ['states' => $states, 'invalid' => ['category' => $meta[0], 'stage' => $meta[1],
+            'layer' => $meta[2] - 1, 'index' => $meta[3], 'value' => $invalid]];
+    }
+
+    /** @param list<int> $ids
+     * @param list<bool> $mask
+     * @param list<int> $types
+     * @return array{category: int, stage: int, layer: int, index: int, value: float}
+     */
+    public function benchmarkFinite(array $ids, array $mask, array $types, int $batch, int $sequence): array
+    {
+        $count = $batch * $sequence;
+        $idBuffer = $this->buffer("int64_t[{$count}]");
+        $maskBuffer = $this->buffer("uint8_t[{$count}]");
+        $typeBuffer = $this->buffer("int64_t[{$count}]");
+        $packedIds = pack('q*', ...$ids);
+        $packedTypes = pack('q*', ...$types);
+        $packedMask = pack('C*', ...array_map(static fn ($value): int => $value ? 1 : 0, $mask));
+        FFI::memcpy($idBuffer, $packedIds, strlen($packedIds));
+        FFI::memcpy($typeBuffer, $packedTypes, strlen($packedTypes));
+        FFI::memcpy($maskBuffer, $packedMask, strlen($packedMask));
+        $metadata = $this->buffer('uint64_t[4]');
+        $invalidValue = $this->buffer('float[1]');
+        if ($this->invoke(
+            'transformer_cuda_bge_diagnose',
+            $this->handle(),
+            $idBuffer,
+            $maskBuffer,
+            $typeBuffer,
+            $batch,
+            $sequence,
+            $this->ffi->cast('float *', 0),
+            0,
+            $metadata,
+            $invalidValue
+        ) !== 0) {
+            throw new BackendException('CUDA finite diagnostic failed.');
+        }
+        $decodedMetadata = unpack('P*', FFI::string($metadata, 32));
+        $decodedInvalid = unpack('gvalue', FFI::string($invalidValue, 4));
+        if ($decodedMetadata === false || $decodedInvalid === false) {
+            throw new BackendException('CUDA finite diagnostic is malformed.');
+        }
+        $meta = $this->decodeDiagnosticMetadata($decodedMetadata);
+        $invalid = $decodedInvalid['value'];
+        if (!is_float($invalid)) {
+            throw new BackendException('CUDA finite diagnostic value is malformed.');
+        }
+
+        return ['category' => $meta[0], 'stage' => $meta[1], 'layer' => $meta[2] - 1,
+            'index' => $meta[3], 'value' => $invalid];
+    }
+
+    /** @param array<int|string, mixed> $decoded
+     * @return list<int>
+     */
+    private function decodeDiagnosticMetadata(array $decoded): array
+    {
+        $metadata = [];
+        foreach ($decoded as $value) {
+            if (!is_int($value)) {
+                throw new BackendException('CUDA diagnostic metadata is malformed.');
+            }
+            $metadata[] = $value;
+        }
+        if (count($metadata) !== 4) {
+            throw new BackendException('CUDA diagnostic metadata is incomplete.');
+        }
+
+        return $metadata;
+    }
+
+    /** @return int<0, max> */
+    private function checkedBytes(int $elements, int $elementSize): int
+    {
+        if ($elements < 0 || $elementSize < 0 || ($elementSize !== 0 && $elements > intdiv(PHP_INT_MAX, $elementSize))) {
+            throw new BackendException('CUDA diagnostic byte size overflows PHP integer capacity.');
+        }
+
+        return $elements * $elementSize;
     }
 
     /** @param list<int> $ids

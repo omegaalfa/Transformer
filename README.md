@@ -45,7 +45,9 @@ $embedding = $model->encode('Como solicitar férias?');
 O mesmo produto possui um caminho CUDA opt-in: os 197 parâmetros permanecem
 residentes na GPU, o forward inteiro executa sem transferências entre as 12
 camadas e somente o embedding normalizado `[B,384]` retorna ao PHP. Consulte o
-[inventário GPU-R1](docs/gpu-runtime.md) para a API completa e um exemplo.
+[runtime CUDA](docs/gpu-runtime.md) para a API completa e exemplos. FP32 é o
+modo compatível padrão; FP16 e BF16 são modos opt-in selecionados explicitamente
+no loader quando a aplicação aceita o contrato numérico validado pelo GPU-R4.1.
 
 ## Estado atual
 
