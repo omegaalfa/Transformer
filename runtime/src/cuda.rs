@@ -16,6 +16,15 @@ extern "C" {
         data: *const f32,
         count: usize,
     ) -> c_int;
+    fn cuda_bge_set_parameter_bytes_impl(
+        handle: *mut c_void,
+        index: c_int,
+        data: *const u8,
+        byte_count: usize,
+        rows: c_int,
+        columns: c_int,
+        transpose: c_int,
+    ) -> c_int;
     fn cuda_bge_finalize_impl(handle: *mut c_void) -> c_int;
     fn cuda_bge_set_math_mode_impl(handle: *mut c_void, mode: c_int) -> c_int;
     fn cuda_bge_set_graph_enabled_impl(handle: *mut c_void, enabled: c_int) -> c_int;
@@ -99,6 +108,26 @@ pub unsafe extern "C" fn transformer_cuda_bge_set_parameter(
     count: usize,
 ) -> c_int {
     unsafe { cuda_bge_set_parameter_impl(handle, index, data, count) }
+}
+/// # Safety
+/// `data` must address `byte_count` bytes containing little-endian Float32
+/// values. `rows * columns * 4` must equal `byte_count`.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_cuda_bge_set_parameter_bytes(
+    handle: *mut c_void,
+    index: c_int,
+    data: *const u8,
+    byte_count: usize,
+    rows: c_int,
+    columns: c_int,
+    transpose: c_int,
+) -> c_int {
+    if ![0, 1].contains(&transpose) {
+        return 1;
+    }
+    unsafe {
+        cuda_bge_set_parameter_bytes_impl(handle, index, data, byte_count, rows, columns, transpose)
+    }
 }
 /// # Safety
 /// `handle` must be a live CUDA BGE handle created by this library.

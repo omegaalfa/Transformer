@@ -100,6 +100,22 @@ final class SafetensorsReaderTest extends TestCase
         self::assertSame($secondBytes, $tensor->bytes);
     }
 
+    public function testReadSessionParsesOnceAndReadsMultiplePayloads(): void
+    {
+        $first = pack('g*', 1.0, -2.0);
+        $second = pack('g', 3.5);
+        $path = $this->writeSafetensors([
+            'first' => ['dtype' => 'F32', 'shape' => [2], 'data_offsets' => [0, 8]],
+            'second' => ['dtype' => 'F32', 'shape' => [1], 'data_offsets' => [8, 12]],
+        ], $first.$second);
+
+        $session = (new SafetensorsReader())->open($path);
+
+        self::assertSame(['first', 'second'], array_keys($session->weightMap->tensors));
+        self::assertSame($second, $session->read('second'));
+        self::assertSame($first, $session->read('first'));
+    }
+
     public function testReadsEmptyTensorWithoutPayloadAllocation(): void
     {
         $path = $this->writeSafetensors([

@@ -6,9 +6,11 @@ namespace Omegaalfa\Transformer\Tests\Integration\Embedding;
 
 use Omegaalfa\Transformer\Backend\BackendType;
 use Omegaalfa\Transformer\Backend\Cuda\CudaBgePrecision;
+use Omegaalfa\Transformer\Backend\Cuda\CudaBgeLibrary;
 use Omegaalfa\Transformer\Backend\Ffi\FfiBackend;
 use Omegaalfa\Transformer\Backend\Ffi\NativeLibrary;
 use Omegaalfa\Transformer\Embedding\CudaBgeEmbeddingModel;
+use Omegaalfa\Transformer\Exception\BackendException;
 use Omegaalfa\Transformer\Model\Loader\CudaBgeEmbeddingModelLoader;
 use Omegaalfa\Transformer\Runtime\Runtime;
 use Omegaalfa\Transformer\Runtime\RuntimeConfig;
@@ -101,6 +103,27 @@ final class CudaBgeEmbeddingTest extends TestCase
         }
         self::assertNotSame($models['Float32']->library->identity(), $models['Float16']->library->identity());
         self::assertNotSame($models['Float16']->library->identity(), $models['BFloat16']->library->identity());
+    }
+
+    public function testBinaryParameterFailureDoesNotPublishPartialNativeParameter(): void
+    {
+        $checkpoint = getenv('TRANSFORMER_BGE_CUDA_CHECKPOINT');
+        if (!is_string($checkpoint) || $checkpoint === '') {
+            self::markTestSkipped('Set TRANSFORMER_BGE_CUDA_CHECKPOINT and build runtime with --features cuda.');
+        }
+        $library = new CudaBgeLibrary(NativeLibrary::defaultPath(dirname(__DIR__, 3)));
+        $invalid = array_fill(0, 384, 1.0);
+        $invalid[191] = INF;
+        try {
+            $library->setParameterBytes(3, pack('g*', ...$invalid), [384, 1], false);
+            self::fail('Non-finite binary parameter was accepted.');
+        } catch (BackendException) {
+            self::assertSame(0, $library->parameterCount());
+        }
+
+        $library->setParameterBytes(3, pack('g*', ...array_fill(0, 384, 1.0)), [384, 1], false);
+        self::assertSame(1, $library->parameterCount());
+        $library->destroy();
     }
 
     /**

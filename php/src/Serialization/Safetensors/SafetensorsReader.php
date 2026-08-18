@@ -14,6 +14,21 @@ final class SafetensorsReader implements SafetensorsReaderInterface
     private const int PREFIX_BYTES = 8;
     private const int MAX_HEADER_BYTES = 100_000_000;
 
+    public function open(string $path): SafetensorsReadSession
+    {
+        $handle = @fopen($path, 'rb');
+        if ($handle === false) {
+            throw new SerializationException(sprintf('Unable to open Safetensors file: %s', $path));
+        }
+
+        try {
+            return new SafetensorsReadSession($handle, $this->inspect($handle, $path));
+        } catch (\Throwable $exception) {
+            fclose($handle);
+            throw $exception;
+        }
+    }
+
     public function metadata(string $path): WeightMap
     {
         $handle = @fopen($path, 'rb');

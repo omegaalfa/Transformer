@@ -263,3 +263,32 @@ soak were bitwise deterministic and had zero VRAM delta in both modes.
 FP16 and BF16 are accepted explicit opt-in modes. FP32 remains the default;
 applications must select a mixed mode deliberately after accepting its
 numerical accuracy contract.
+
+## MODEL-R7: direct checkpoint loading
+
+The CUDA loader reads the Safetensors header once and keeps one file session
+open while consuming all 197 payloads. F32 little-endian payload bytes cross a
+private loader-only FFI boundary: native code validates finiteness, applies the
+PyTorch `[out,in]` to runtime `[in,out]` transpose where declared, converts to
+FP16/BF16 when selected, and uploads the final resident parameter. No checkpoint
+weight becomes a PHP `list<float>`, CPU Tensor, or per-element zval. The normal
+CPU loader and `Tensor::toFloat32()` contracts are unchanged.
+
+```php
+$loader = new CudaBgeEmbeddingModelLoader(
+    $runtime,
+    NativeLibrary::defaultPath($projectRoot),
+    CudaBgePrecision::Float16,
+);
+$model = $loader->load('/models/bge-small-en-v1.5');
+$embedding = $model->encode('hello world');
+```
+
+On the validation host, the original FP32 load took 22.645 s, including
+16.589 s of decode/materialization and 3.731 s of CPU Tensor copy-out. The
+direct first cold-ish load took 1.208 s; five same-process/page-cache loads had
+0.710 s p50 and 1.208 s p95. The optimized decode/staging phase was 0.547 s
+on that first controlled run, with 132,848,640 payload bytes read,
+zero CPU Tensor materialization, 46,881,792 bytes maximum single payload, and
+approximately 100 MB PHP peak memory versus 722 MB before. Page cache was not
+dropped because doing so safely requires host-level privileges.

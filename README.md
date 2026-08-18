@@ -48,6 +48,9 @@ camadas e somente o embedding normalizado `[B,384]` retorna ao PHP. Consulte o
 [runtime CUDA](docs/gpu-runtime.md) para a API completa e exemplos. FP32 é o
 modo compatível padrão; FP16 e BF16 são modos opt-in selecionados explicitamente
 no loader quando a aplicação aceita o contrato numérico validado pelo GPU-R4.1.
+O loader CUDA consome os bytes F32 do Safetensors diretamente, valida e transpõe
+os pesos no código nativo e os mantém residentes sem criar arrays PHP por peso;
+consulte a seção MODEL-R7 da documentação CUDA para o exemplo e as medições.
 
 ## Estado atual
 

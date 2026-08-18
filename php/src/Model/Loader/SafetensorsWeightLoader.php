@@ -6,7 +6,9 @@ namespace Omegaalfa\Transformer\Model\Loader;
 
 use Omegaalfa\Transformer\Exception\SerializationException;
 use Omegaalfa\Transformer\NN\Parameter;
+use Omegaalfa\Transformer\Serialization\Safetensors\SafetensorsReader;
 use Omegaalfa\Transformer\Serialization\Safetensors\SafetensorsReaderInterface;
+use Omegaalfa\Transformer\Serialization\Safetensors\SerializedTensor;
 
 final readonly class SafetensorsWeightLoader implements WeightLoaderInterface
 {
@@ -19,7 +21,13 @@ final readonly class SafetensorsWeightLoader implements WeightLoaderInterface
 
     public function load(string $path): array
     {
-        $weightMap = $this->reader->metadata($path);
+        if ($this->reader instanceof SafetensorsReader) {
+            $session = $this->reader->open($path);
+            $weightMap = $session->weightMap;
+        } else {
+            $session = null;
+            $weightMap = $this->reader->metadata($path);
+        }
         $expectedNames = [];
 
         foreach ($this->manifest->parameters as $parameter) {
@@ -60,7 +68,9 @@ final readonly class SafetensorsWeightLoader implements WeightLoaderInterface
         $loaded = [];
 
         foreach ($this->manifest->parameters as $parameter) {
-            $serialized = $this->reader->tensor($path, $parameter->checkpointName);
+            $serialized = $session === null
+                ? $this->reader->tensor($path, $parameter->checkpointName)
+                : new SerializedTensor($weightMap->tensors[$parameter->checkpointName], $session->read($parameter->checkpointName));
             $tensor = $this->materializer->materialize($serialized, $parameter->materialization);
             $loaded[$parameter->parameterName] = new Parameter(
                 name: $parameter->parameterName,

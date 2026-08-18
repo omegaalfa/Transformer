@@ -21,6 +21,8 @@ final class CudaBgeLibrary
             void *transformer_cuda_bge_create(void);
             void *transformer_cuda_bge_create_precision(int precision);
             int transformer_cuda_bge_set_parameter(void *handle, int index, const float *data, size_t count);
+            int transformer_cuda_bge_set_parameter_bytes(void *handle, int index, const uint8_t *data,
+                size_t byte_count, int rows, int columns, int transpose);
             int transformer_cuda_bge_finalize(void *handle);
             int transformer_cuda_bge_set_math_mode(void *handle, int mode);
             int transformer_cuda_bge_set_graph_enabled(void *handle, int enabled);
@@ -60,6 +62,33 @@ final class CudaBgeLibrary
         FFI::memcpy($buffer, pack('g*', ...$values), count($values) * 4);
         if ($this->invoke('transformer_cuda_bge_set_parameter', $this->handle(), $index, $buffer, count($values)) !== 0) {
             throw new BackendException("CUDA rejected BGE parameter {$index}.");
+        }
+        ++$this->parameterCount;
+    }
+
+    /** Internal checkpoint-loader boundary. The payload is F32 little-endian and never becomes PHP float zvals.
+     * @param array{int, int} $checkpointShape
+     */
+    public function setParameterBytes(int $index, string $bytes, array $checkpointShape, bool $transpose): void
+    {
+        [$rows, $columns] = $checkpointShape;
+        if ($rows < 1 || $columns < 1 || $rows > intdiv(PHP_INT_MAX, $columns)
+            || $rows * $columns > intdiv(PHP_INT_MAX, 4) || strlen($bytes) !== $rows * $columns * 4) {
+            throw new BackendException("CUDA parameter {$index} has invalid F32 payload dimensions.");
+        }
+        $buffer = $this->buffer('uint8_t[' . strlen($bytes) . ']');
+        FFI::memcpy($buffer, $bytes, strlen($bytes));
+        if ($this->invoke(
+            'transformer_cuda_bge_set_parameter_bytes',
+            $this->handle(),
+            $index,
+            $buffer,
+            strlen($bytes),
+            $rows,
+            $columns,
+            $transpose ? 1 : 0
+        ) !== 0) {
+            throw new BackendException("CUDA rejected binary BGE parameter {$index}.");
         }
         ++$this->parameterCount;
     }
@@ -125,12 +154,12 @@ final class CudaBgeLibrary
     /** @return array<string, int|bool> */
     public function benchmarkDiagnostics(): array
     {
-        $buffer = $this->buffer('uint64_t[23]');
-        if ($this->invoke('transformer_cuda_bge_diagnostics', $this->handle(), $buffer, 23) !== 0) {
+        $buffer = $this->buffer('uint64_t[25]');
+        if ($this->invoke('transformer_cuda_bge_diagnostics', $this->handle(), $buffer, 25) !== 0) {
             throw new BackendException('CUDA BGE diagnostics failed.');
         }
-        $decoded = unpack('P*', FFI::string($buffer, 23 * 8));
-        if ($decoded === false || count($decoded) !== 23) {
+        $decoded = unpack('P*', FFI::string($buffer, 25 * 8));
+        if ($decoded === false || count($decoded) !== 25) {
             throw new BackendException('CUDA BGE diagnostics are malformed.');
         }
         $values = [];
@@ -154,6 +183,7 @@ final class CudaBgeLibrary
             'parameter_bytes' => $values[18], 'workspace_bytes' => $values[19],
             'precision' => $values[20],
             'parameter_conversion_ns' => $values[21], 'parameter_upload_ns' => $values[22],
+            'parameter_validation_ns' => $values[23], 'parameter_transpose_ns' => $values[24],
         ];
     }
 

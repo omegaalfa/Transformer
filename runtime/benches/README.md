@@ -61,6 +61,22 @@ mixed-precision stage on device without copying full intermediates during the
 soak. FP16 and BF16 pass the final opt-in gate; FP32 remains the default and no
 automatic precision selection is performed.
 
+MODEL-R7 measures the loader-only path separately from warm inference:
+
+```bash
+TRANSFORMER_BGE_CUDA_CHECKPOINT=/path/to/bge-small-en-v1.5 \
+TRANSFORMER_BGE_LOAD_PRECISION=fp32 \
+TRANSFORMER_BGE_LOAD_SAMPLES=5 \
+php -d xdebug.mode=off runtime/benches/bge_cuda_load.php
+```
+
+`TRANSFORMER_BGE_LOAD_PRECISION` accepts `fp32`, `fp16`, or `bf16`. The report
+separates header parsing, payload I/O, native staging, F32 validation, load-time
+transpose, precision conversion, GPU upload, tokenizer construction, PHP peak
+memory, process RSS high-water mark, and VRAM before/after explicit destroy.
+The first result is cold-ish; later results share the OS page cache. The runner
+does not attempt to drop system page cache.
+
 ## MODEL-R5 BGE end-to-end benchmark
 
 `bge_embedding.php` measures the public sentence-to-embedding path in one PHP
