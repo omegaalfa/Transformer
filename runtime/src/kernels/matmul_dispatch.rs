@@ -12,10 +12,13 @@ pub(crate) enum MatmulBackend {
 /// Empirical single-thread CPU dispatch policy for the Transformer projection
 /// shapes benchmarked on the reference host. Unknown shapes deliberately use
 /// the scalar reference kernel until they have their own measured policy.
-const BLAS_RULES: [BlasRule; 3] = [
+const BLAS_RULES: [BlasRule; 6] = [
     BlasRule::new(768, 768, 4),
     BlasRule::new(768, 3072, 2),
     BlasRule::new(3072, 768, 2),
+    BlasRule::new(384, 384, 4),
+    BlasRule::new(384, 1536, 4),
+    BlasRule::new(1536, 384, 4),
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +81,14 @@ mod tests {
 
     #[test]
     fn policy_uses_measured_blas_thresholds() {
-        for (m, k, n) in [(4, 768, 768), (2, 768, 3072), (2, 3072, 768)] {
+        for (m, k, n) in [
+            (4, 768, 768),
+            (2, 768, 3072),
+            (2, 3072, 768),
+            (4, 384, 384),
+            (4, 384, 1536),
+            (4, 1536, 384),
+        ] {
             assert_eq!(select_backend(m, k, n, true), MatmulBackend::Blas);
         }
         assert_eq!(select_backend(2, 768, 768, true), MatmulBackend::Tiled);
@@ -86,7 +96,14 @@ mod tests {
 
     #[test]
     fn policy_falls_back_to_rust_when_blas_is_unavailable() {
-        for (m, k, n) in [(4, 768, 768), (2, 768, 3072), (2, 3072, 768)] {
+        for (m, k, n) in [
+            (4, 768, 768),
+            (2, 768, 3072),
+            (2, 3072, 768),
+            (4, 384, 384),
+            (4, 384, 1536),
+            (4, 1536, 384),
+        ] {
             assert_eq!(select_backend(m, k, n, false), MatmulBackend::Tiled);
         }
     }
@@ -104,6 +121,10 @@ mod tests {
             (4, 768, 768),
             (2, 768, 3072),
             (2, 3072, 768),
+            (2, 384, 384),
+            (4, 384, 384),
+            (4, 384, 1536),
+            (4, 1536, 384),
             (3, 5, 7),
         ] {
             let a: Vec<f32> = (0..m * k).map(|index| (index % 17) as f32 * 0.01).collect();

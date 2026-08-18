@@ -4,6 +4,8 @@
     "type": "library",
     "license": "MIT",
     "require": {
+        "ext-intl": "*",
+        "ext-mbstring": "*",
         "php": "^8.4"
     },
     "require-dev": {

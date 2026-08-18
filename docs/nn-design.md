@@ -137,7 +137,7 @@ são aceitos; a última dimensão deve coincidir com `input_features`.
 ```text
 Embedding
   peso Parameter [vocabulary_size, dimensions]
-  IDs de token
+IDs de token
   coleta linhas
 ```
 
@@ -151,8 +151,8 @@ PHP valida lista, rank, produto `B*S`, quantidade e intervalo. A bridge cria
 somente um CData `int64_t` temporário; a FFI Rust repete as validações de
 segurança e chama um kernel sobre slices seguros. Erro não consome o weight nem
 publica output parcial. `[0,S]`, `[B,0]` e `[0,0]` são válidos e não acessam o
-weight. `TokenizationResult` continua descrevendo uma sequência; batching e
-padding permanecem fora do tokenizer.
+weight. `TokenizationResult` descreve uma sequência; o `BertTokenizer` aditivo
+também produz batches com padding e máscaras por meio de `BertBatchEncoding`.
 
 ### LayerNorm
 

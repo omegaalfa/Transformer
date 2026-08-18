@@ -7,12 +7,16 @@
 - [ ] **Milestone E** — Zend extension consuming the Rust C ABI.
 - [ ] **Milestone F** — real encoder and Safetensors (validated metadata,
   selective payload reading, Float32 materialization and closed Parameter
-  manifests plus BERT config/model construction complete; tokenizer and
-  sentence-embedding wrapper pending).
+  manifests, BERT model, WordPiece tokenizer and official CLS/L2 embedding
+  wrapper complete; production artifact management pending).
 - [ ] **Milestone G** — ContextEngine integration.
 - [ ] **Milestone H** — CPU optimization after profiling (tiled matmul and optional BLAS complete; SIMD and threads pending).
 - [ ] **Milestone I** — decoder and KV cache.
-- [ ] **Milestone J** — quantization and GPU.
+- [ ] **Milestone J** — quantization and GPU generalization.
+  - [x] **GPU-R1** — additive CUDA path for the validated BGE-small-en-v1.5
+    topology, with 197 resident parameters and one input/output transfer boundary.
+  - [x] **GPU-R2** — persistent stream/workspace, parallel LayerNorm and
+    attention kernels, CUDA Event profiling, with TF32/cuBLASLt candidates rejected.
 
 The intended future integration remains:
 
@@ -100,6 +104,14 @@ The model-loading foundation is also staged independently:
 - [x] **MODEL-R2D** — closed manifest mapping to resident Parameters.
 - [x] **MODEL-R2E** — config validation and atomic BERT-compatible model
   construction.
+- [x] **MODEL-R3** — real BGE checkpoint load and layer-by-layer Float32 parity.
+- [x] **MODEL-R4** — public text-to-embedding pipeline with official WordPiece,
+  CLS pooling and row-wise L2 normalization; generic masked mean remains an
+  explicit non-default strategy.
+- [x] **MODEL-R5** — simple list-returning encode API and resident end-to-end
+  benchmark covering cold load, warm batches, residence and RSS.
+- [x] **MODEL-R6** — calibrated single-thread OpenBLAS dispatch for BGE
+  384/1536 projections with real-model profiling and parity preservation.
 
 See [`nn-design.md`](nn-design.md) for the decisions and deferred scope.
 See [`model-loading.md`](model-loading.md) for the loader contracts and current

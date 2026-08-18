@@ -42,6 +42,11 @@ um encoder capaz de gerar embeddings nativamente:
 $embedding = $model->encode('Como solicitar férias?');
 ```
 
+O mesmo produto possui um caminho CUDA opt-in: os 197 parâmetros permanecem
+residentes na GPU, o forward inteiro executa sem transferências entre as 12
+camadas e somente o embedding normalizado `[B,384]` retorna ao PHP. Consulte o
+[inventário GPU-R1](docs/gpu-runtime.md) para a API completa e um exemplo.
+
 ## Estado atual
 
 A fase fundamental do Tensor nativo, dividida nos gates T1–T10, está concluída.
@@ -147,6 +152,7 @@ Documentação arquitetural:
 - [Revisão da camada NN](docs/nn-design.md)
 - [Roadmap](docs/roadmap.md)
 - [Guia de continuidade](guia.md)
+- [Runtime CUDA BGE e inventário GPU-R1](docs/gpu-runtime.md)
 
 ## Requisitos
 
@@ -174,6 +180,12 @@ Compile o runtime nativo em modo release:
 
 ```bash
 cargo build --manifest-path runtime/Cargo.toml --release
+```
+
+Para o caminho aditivo CUDA do `BAAI/bge-small-en-v1.5`:
+
+```bash
+cargo build --manifest-path runtime/Cargo.toml --release --features cuda
 ```
 
 Artefatos esperados:
@@ -336,12 +348,13 @@ FASE TRANSFORMER
   Residual + TransformerBlock                 ✅ concluída
 
 MODELO REAL
-  tokenizer e vocabulário                     ⬜
+  tokenizer WordPiece BERT oficial            ✅ concluída
   Safetensors metadata e payload              ✅ concluída
   Float32 → Tensor/Parameter manifest          ✅ concluída
   config BERT                                 ✅ concluída
   encoder BERT/BGE last hidden state          ✅ concluída
-  pooling e embeddings                        ⬜
+  CLS pooling BGE + normalização L2           ✅ concluída
+  dispatch OpenBLAS calibrado para 384/1536    ✅ concluída
 ```
 
 O loader atual valida o layout completo do arquivo, lê payloads por nome,
@@ -351,6 +364,55 @@ declarada no manifesto. F16, BF16, I64 e I8 são reconhecidos como metadata,
 mas somente F32 é materializado. O encoder BERT aditivo implementa embeddings
 absolutos, atenção com bias, GELU exata e blocos Post-Norm. Veja
 [`docs/model-loading.md`](docs/model-loading.md).
+
+O produto de sentence embeddings usa `BgeEmbeddingModelLoader` para carregar
+modelo e tokenizer uma vez. `BgeEmbeddingModel::encode()` aceita uma frase e
+`encodeBatch()` aceita múltiplas frases, aplica padding com máscara, executa o
+BERT residente, seleciona o hidden state do token `[CLS]` na posição zero e
+normaliza cada linha com norma L2. A saída do BGE small possui shape `[B,384]`.
+
+Exemplo completo, considerando que o diretório informado contém os artefatos
+oficiais `config.json`, `model.safetensors` e `tokenizer.json`:
+
+```php
+use Omegaalfa\Transformer\Backend\BackendType;
+use Omegaalfa\Transformer\Backend\Ffi\FfiBackend;
+use Omegaalfa\Transformer\Backend\Ffi\NativeLibrary;
+use Omegaalfa\Transformer\Model\Loader\BgeEmbeddingModelLoader;
+use Omegaalfa\Transformer\Runtime\Runtime;
+use Omegaalfa\Transformer\Runtime\RuntimeConfig;
+
+$library = new NativeLibrary(NativeLibrary::defaultPath(__DIR__));
+$backend = new FfiBackend($library);
+$runtime = new Runtime($backend, new RuntimeConfig(BackendType::Ffi));
+
+// Carrega tokenizer, BERT e os 197 Parameters residentes uma única vez.
+$embeddings = (new BgeEmbeddingModelLoader($runtime))->load(
+    __DIR__ . '/models/bge-small-en-v1.5',
+);
+
+// Uma frase retorna diretamente list<float> com 384 valores.
+$single = $embeddings->encode('hello world');
+
+// O batch recebe padding automático e retorna list<list<float>> [2, 384].
+$batch = $embeddings->encodeBatch([
+    'hello world',
+    'The quick brown fox jumps over the lazy dog.',
+]);
+```
+
+`encode()` e `encodeBatch()` escondem tokenizer, máscaras e Tensors
+intermediários e materializam somente o resultado público. Para inspeção,
+`encodeTensor()` retorna o Tensor normalizado e `encodeBatchOutput()` preserva
+o `BgeEmbeddingOutput` do MODEL-R4, com `pooled` e `embedding`.
+CLS é o default oficial. O componente genérico `MeanPooling` continua
+disponível e pode ser selecionado explicitamente com
+`BgePoolingStrategy::Mean`; esse modo não representa o pooling oficial do BGE.
+
+O modelo deve ser carregado uma vez e usado em muitas chamadas de `encode`.
+Atualmente o caminho recomendado é um processo PHP persistente — CLI ou worker
+de longa duração — para manter os 197 Parameters nativos residentes. O projeto
+não fornece integração específica com servidor neste estágio.
 
 A revisão NN-R1 determinou que não serão adicionadas operações numéricas
 aleatórias. Cada novo kernel deverá existir para atender uma necessidade

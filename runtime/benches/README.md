@@ -1,5 +1,152 @@
 # Rust kernel benchmarks
 
+## GPU-R1 BGE end-to-end benchmark
+
+Build the opt-in CUDA runtime and run the real-checkpoint benchmark:
+
+```bash
+cargo build --release --manifest-path runtime/Cargo.toml --features cuda
+TRANSFORMER_BGE_CUDA_CHECKPOINT=/path/to/bge-small-en-v1.5 \
+TRANSFORMER_BGE_CUDA_SAMPLES=15 \
+TRANSFORMER_BGE_CUDA_SOAK=100 \
+php -d xdebug.mode=off runtime/benches/bge_cuda.php
+```
+
+The runner includes five warmups, official Float32 parity, 15 latency samples,
+parameter-handle identity, determinism, and CUDA free-memory checks across 100
+additional forwards. On the RTX 3060 validation host it measured p50/p95
+`8.675/12.759 ms`; maximum absolute/relative error was
+`1.0430813e-7/3.5754e-5`, all 197 parameters remained resident, and free-memory
+delta after the soak was zero. The only forward transfers are IDs/mask/types
+H2D and the final `[B,384]` embedding D2H.
+
+GPU-R2 adds CUDA Event profiling with:
+
+```bash
+TRANSFORMER_BGE_CUDA_CHECKPOINT=/path/to/bge-small-en-v1.5 \
+TRANSFORMER_BGE_CUDA_PROFILE_SAMPLES=5 \
+php -d xdebug.mode=off runtime/benches/bge_cuda_profile_events.php
+```
+
+The optimized path uses a persistent workspace/stream and parallel LayerNorm,
+attention, and CLS/L2 kernels. The final 25-sample short-input run measured
+p50/p95 `3.260/10.195 ms`, compared with GPU-R1 `8.675/12.759 ms`. Steady-state
+allocation/free counts are zero, the logical launch count is 207, and one
+explicit stream synchronization occurs at final D2H. TF32 and cuBLAS batched
+attention were measured and rejected; strict FP32 and specialized attention
+remain production defaults.
+
+## MODEL-R5 BGE end-to-end benchmark
+
+`bge_embedding.php` measures the public sentence-to-embedding path in one PHP
+process. It loads config, tokenizer, Safetensors and all 197 Parameters once,
+then measures warm `encode()`/`encodeBatch()`, recreate versus resident use and
+RSS. The public methods include tokenization, BERT, official CLS pooling, L2
+normalization and final PHP-list materialization.
+
+```bash
+TRANSFORMER_BGE_CHECKPOINT=/tmp/transformer-model-r3/bge-small-en-v1.5 \
+TRANSFORMER_BGE_SAMPLES=15 \
+TRANSFORMER_BGE_RECREATE_SAMPLES=3 \
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+php -d xdebug.mode=off runtime/benches/bge_embedding.php
+```
+
+The controlled reference run used one OpenBLAS thread. Warm single used 15
+samples after three warmups. The complete batch matrix used three samples per
+cell because the B=32/66-token case alone takes roughly 82 seconds per sample;
+therefore its p95/p99 equal the observed maximum and are descriptive rather
+than robust tail estimates. Effective lengths were short=9, medium=26 and
+long=66 WordPiece tokens.
+
+Cold load took 10,226.725 ms. Warm short single encode measured p50/p95/p99
+347.567/381.050/381.050 ms, mean 352.514 ms, min 338.052 ms and max 381.050 ms.
+
+| Tokens | Batch | p50 ms | p95/p99 ms | Mean sentences/s |
+|---:|---:|---:|---:|---:|
+| 9 | 1 | 345.181 | 351.627 | 2.884 |
+| 9 | 2 | 694.533 | 707.195 | 2.886 |
+| 9 | 8 | 2,834.398 | 3,681.089 | 2.583 |
+| 9 | 16 | 5,693.875 | 6,040.748 | 2.826 |
+| 9 | 32 | 11,422.180 | 11,690.759 | 2.813 |
+| 26 | 1 | 1,001.904 | 1,016.230 | 0.997 |
+| 26 | 2 | 2,251.663 | 2,616.169 | 0.876 |
+| 26 | 8 | 8,827.401 | 9,028.633 | 0.900 |
+| 26 | 16 | 16,080.239 | 17,538.863 | 0.972 |
+| 26 | 32 | 32,446.991 | 35,203.270 | 0.964 |
+| 66 | 1 | 2,732.832 | 2,869.942 | 0.368 |
+| 66 | 2 | 5,570.043 | 9,547.648 | 0.296 |
+| 66 | 8 | 20,398.461 | 21,259.621 | 0.388 |
+| 66 | 16 | 40,965.032 | 41,450.858 | 0.390 |
+| 66 | 32 | 82,163.675 | 84,247.000 | 0.391 |
+
+For a 9-token sentence, resident mean latency was 359.598 ms versus
+10,055.990 ms for load+encode+destroy, a 27.965x difference. Parameter storage
+identities remained unchanged. RSS was 285,560,832 bytes after load,
+287,346,688 after warmup and 375,697,408 after the matrix; ten subsequent
+forwards remained exactly at 375,697,408 bytes, showing no progressive growth
+in this workload. Peak PHP-reported allocation was 728,469,504 bytes.
+
+The pre-benchmark official reference check passed with maximum absolute error
+1.9371509552001953e-7 and maximum relative error
+5.0901316382054526e-5 under the unchanged MODEL-R4 Float32 tolerance.
+
+## MODEL-R6 BGE dispatcher calibration
+
+Profiling showed that every BGE projection (`384→384`, `384→1536` and
+`1536→384`) was classified as unknown and sent to `current_scalar`. The
+production dispatcher now uses the measured BGE policy: M=1 remains
+cache-friendly, M=2 uses the tiled fallback, and OpenBLAS is selected from M=4.
+The historical 768/3072 rules are unchanged.
+
+Reproduce kernel calibration and the real-model stage profile with:
+
+```bash
+TRANSFORMER_BENCH_PROFILE=crossover \
+TRANSFORMER_BENCH_FILTER=matmul \
+TRANSFORMER_BENCH_PROJECTION=384x1536 \
+TRANSFORMER_BENCH_MAX_M=72 \
+TRANSFORMER_BENCH_SAMPLES=3 \
+TRANSFORMER_BLAS_THREADS=1 \
+    cargo bench --manifest-path runtime/Cargo.toml --bench kernels
+
+TRANSFORMER_BENCH_FILTER=bert_attention_profile \
+TRANSFORMER_BENCH_SAMPLES=15 \
+TRANSFORMER_BLAS_THREADS=1 \
+    cargo bench --manifest-path runtime/Cargo.toml --bench kernels
+
+TRANSFORMER_BGE_PROFILE_SAMPLES=5 \
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+    php -d xdebug.mode=off runtime/benches/bge_forward_profile.php
+```
+
+For B=1/S=9, the scalar profile attributed 28.73% to attention, 32.92% to
+FFN input Linear and 34.42% to FFN output Linear. After calibrated dispatch,
+attention was 34.64%, both FFN Linears together were 29.00%, ExactGELU was
+28.38%, residual/LayerNorm was 5.38%, and embeddings/pooling/L2/final PHP
+materialization together were 1.28%. The dominant bottleneck therefore moved
+from scalar GEMM to native attention and ExactGELU.
+
+The 25-sample optimized short encode measured p50/p95/p99
+34.682/41.169/42.863 ms versus the MODEL-R5 p50/p95 of
+347.567/381.050 ms: 10.02x median speedup and a 89.2% lower p95. The complete
+15-sample matrix measured:
+
+| Tokens | Batch | p50 before | p50 after | Speedup | After sentences/s |
+|---:|---:|---:|---:|---:|---:|
+| 9 | 1 | 345.181 ms | 36.768 ms | 9.39x | 26.29 |
+| 9 | 8 | 2,834.398 ms | 163.544 ms | 17.33x | 48.62 |
+| 26 | 1 | 1,001.904 ms | 72.628 ms | 13.79x | 13.67 |
+| 26 | 8 | 8,827.401 ms | 463.136 ms | 19.06x | 16.52 |
+| 66 | 1 | 2,732.832 ms | 190.616 ms | 14.34x | 5.11 |
+| 66 | 8 | 20,398.461 ms | 1,408.760 ms | 14.48x | 5.65 |
+
+The optimized run retained all 197 Parameter storages. RSS stabilized at
+381,100,032 bytes for 25 additional forwards. Full embedding parity passed
+with maximum absolute/relative error 9.685754776000977e-8 /
+2.95461479292632e-5; all 13 reference hidden states also remained inside the
+unchanged MODEL-R3 tolerance.
+
 This benchmark target measures the current scalar reference kernels without
 changing their visibility or the runtime ABI. It uses only the Rust standard
 library and always runs through Cargo's optimized `bench` profile.

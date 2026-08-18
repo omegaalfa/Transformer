@@ -100,6 +100,7 @@ fn main() {
         || matches_filter(&filter, "fusion")
         || matches_filter(&filter, "lifecycle")
         || matches_filter(&filter, "blas_threads")
+        || matches_filter(&filter, "bert_attention_profile")
     {
         let blas_threads = environment_usize("TRANSFORMER_BLAS_THREADS", 1);
         let blas_info = bench_blas::configure(blas_threads);
@@ -121,6 +122,9 @@ fn main() {
         if matches_filter(&filter, "blas_threads") {
             benchmark_blas_thread_scaling(samples, target);
         }
+        if matches_filter(&filter, "bert_attention_profile") {
+            benchmark_bert_attention_phases(samples, target);
+        }
     }
     if matches_filter(&filter, "softmax") {
         benchmark_softmax(profile, samples, target);
@@ -133,6 +137,131 @@ fn main() {
     }
     if matches_filter(&filter, "transpose") {
         benchmark_transpose(profile, samples, target);
+    }
+}
+
+fn benchmark_bert_attention_phases(samples: usize, target: Duration) {
+    const D: usize = 384;
+    const HEADS: usize = 12;
+    println!("bert_attention,sequence,phase,median_us,p95_us,p99_us");
+    for sequence in [9usize, 26, 66] {
+        let input = deterministic_values(sequence * D, 0.001);
+        let weight = deterministic_values(D * D, 0.002);
+        let mut q = vec![0.0; sequence * D];
+        let mut k = vec![0.0; sequence * D];
+        let mut v = vec![0.0; sequence * D];
+        let mut scores = vec![0.0; HEADS * sequence * sequence];
+        let mut merged = vec![0.0; sequence * D];
+        let mut output = vec![0.0; sequence * D];
+        let projection = |destination: &mut [f32]| {
+            matmul_dispatch::matmul_dispatch_f32(&input, &weight, destination, sequence, D, D)
+                .unwrap();
+        };
+        projection(&mut q);
+        projection(&mut k);
+        projection(&mut v);
+        let phases = [
+            (
+                "q_projection",
+                measure(samples, target, || projection(&mut q)),
+            ),
+            (
+                "k_projection",
+                measure(samples, target, || projection(&mut k)),
+            ),
+            (
+                "v_projection",
+                measure(samples, target, || projection(&mut v)),
+            ),
+            (
+                "attention_scores",
+                measure(samples, target, || {
+                    attention_scores(&q, &k, &mut scores, sequence)
+                }),
+            ),
+            (
+                "softmax_mask",
+                measure(samples, target, || attention_softmax(&mut scores, sequence)),
+            ),
+            (
+                "attention_x_v",
+                measure(samples, target, || {
+                    attention_values(&scores, &v, &mut merged, sequence)
+                }),
+            ),
+            (
+                "output_projection",
+                measure(samples, target, || {
+                    matmul_dispatch::matmul_dispatch_f32(
+                        &merged,
+                        &weight,
+                        &mut output,
+                        sequence,
+                        D,
+                        D,
+                    )
+                    .unwrap();
+                }),
+            ),
+        ];
+        for (phase, measurement) in phases {
+            println!(
+                "bert_attention,{sequence},{phase},{:.3},{:.3},{:.3}",
+                measurement.median.as_secs_f64() * 1e6,
+                measurement.p95.as_secs_f64() * 1e6,
+                measurement.p99.as_secs_f64() * 1e6,
+            );
+        }
+    }
+}
+
+fn attention_scores(q: &[f32], k: &[f32], scores: &mut [f32], sequence: usize) {
+    const D: usize = 384;
+    const HEADS: usize = 12;
+    const HD: usize = D / HEADS;
+    let scale = 1.0f32 / (HD as f32).sqrt();
+    for head in 0..HEADS {
+        for query in 0..sequence {
+            for key in 0..sequence {
+                let mut score = 0.0;
+                for inner in 0..HD {
+                    score += q[query * D + head * HD + inner] * k[key * D + head * HD + inner];
+                }
+                scores[(head * sequence + query) * sequence + key] = score * scale;
+            }
+        }
+    }
+}
+
+fn attention_softmax(scores: &mut [f32], sequence: usize) {
+    for row in scores.chunks_exact_mut(sequence) {
+        let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0;
+        for value in row.iter_mut() {
+            *value = (*value - maximum).exp();
+            sum += *value;
+        }
+        for value in row {
+            *value /= sum;
+        }
+    }
+}
+
+fn attention_values(probabilities: &[f32], v: &[f32], merged: &mut [f32], sequence: usize) {
+    const D: usize = 384;
+    const HEADS: usize = 12;
+    const HD: usize = D / HEADS;
+    for head in 0..HEADS {
+        for query in 0..sequence {
+            for inner in 0..HD {
+                let mut value = 0.0;
+                for key in 0..sequence {
+                    value += probabilities[(head * sequence + query) * sequence + key]
+                        * v[key * D + head * HD + inner];
+                }
+                merged[query * D + head * HD + inner] = value;
+            }
+        }
     }
 }
 
@@ -749,8 +878,17 @@ fn run_selected_backend(
 }
 
 fn crossover_matmul_cases() -> Vec<(usize, usize, usize)> {
-    const M_VALUES: [usize; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
-    const PROJECTIONS: [(usize, usize); 3] = [(768, 768), (768, 3072), (3072, 768)];
+    const M_VALUES: [usize; 16] = [
+        1, 2, 4, 8, 9, 16, 26, 32, 64, 66, 72, 128, 208, 256, 512, 528,
+    ];
+    const PROJECTIONS: [(usize, usize); 6] = [
+        (768, 768),
+        (768, 3072),
+        (3072, 768),
+        (384, 384),
+        (384, 1536),
+        (1536, 384),
+    ];
     let maximum_m = environment_usize("TRANSFORMER_BENCH_MAX_M", usize::MAX);
     let projection = env::var("TRANSFORMER_BENCH_PROJECTION").ok();
 

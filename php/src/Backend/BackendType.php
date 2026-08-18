@@ -9,4 +9,5 @@ enum BackendType: string
     case PurePhp = 'pure-php';
     case Ffi = 'ffi';
     case NativeExtension = 'native-extension';
+    case Cuda = 'cuda';
 }

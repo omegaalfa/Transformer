@@ -11,6 +11,10 @@ crate-type = ["cdylib"]
 [dependencies]
 libm = "0.2"
 
+[features]
+default = []
+cuda = []
+
 [[bench]]
 name = "kernels"
 harness = false
