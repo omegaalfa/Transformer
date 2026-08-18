@@ -339,16 +339,17 @@ MODELO REAL
   tokenizer e vocabulário                     ⬜
   Safetensors metadata e payload              ✅ concluída
   Float32 → Tensor/Parameter manifest          ✅ concluída
-  config BERT                                 ⬜
-  encoder BERT/BGE                            ⬜
+  config BERT                                 ✅ concluída
+  encoder BERT/BGE last hidden state          ✅ concluída
   pooling e embeddings                        ⬜
 ```
 
 O loader atual valida o layout completo do arquivo, lê payloads por nome,
 materializa somente Float32 e converte pesos `Linear` PyTorch
 `[out,in]` para o contrato interno `[in,out]` apenas quando essa orientação é
-declarada no manifesto. F16, BF16 e I8 são reconhecidos como metadata, mas não
-são convertidos silenciosamente. Veja
+declarada no manifesto. F16, BF16, I64 e I8 são reconhecidos como metadata,
+mas somente F32 é materializado. O encoder BERT aditivo implementa embeddings
+absolutos, atenção com bias, GELU exata e blocos Post-Norm. Veja
 [`docs/model-loading.md`](docs/model-loading.md).
 
 A revisão NN-R1 determinou que não serão adicionadas operações numéricas

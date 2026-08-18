@@ -125,6 +125,23 @@ final class SafetensorsWeightLoaderTest extends TestCase
         }
     }
 
+    public function testAllowsOnlyExplicitlyIgnoredNonParameterTensors(): void
+    {
+        $path = $this->writeSafetensors([
+            'weight' => ['dtype' => 'F32', 'shape' => [1], 'data_offsets' => [0, 4]],
+            'position_ids' => ['dtype' => 'I64', 'shape' => [1], 'data_offsets' => [4, 12]],
+        ], pack('g', 2.0).str_repeat("\0", 8));
+        $backend = new LoaderRecordingBackend();
+        $loader = $this->loader($backend, new WeightManifest([
+            $this->identitySpec('weight', 'weight', [1]),
+        ], ['position_ids']));
+
+        $parameters = $loader->load($path);
+
+        self::assertSame(['weight'], array_keys($parameters));
+        self::assertSame([[2.0]], $backend->materializedValues);
+    }
+
     public function testRejectsShapeMismatchBeforeMaterializingAnything(): void
     {
         $path = $this->writeSafetensors([

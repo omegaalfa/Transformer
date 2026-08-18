@@ -115,6 +115,58 @@ final readonly class NativeLibrary
         return new Tensor($outputStorage->shape(), $outputStorage);
     }
 
+    public function exactGelu(Tensor $input): Tensor
+    {
+        $storage = $input->storage();
+        if (!$storage instanceof NativeStorage) {
+            throw new \LogicException('ExactGELU requires native storage.');
+        }
+
+        $outputStorage = $storage->exactGelu($this->ffi);
+
+        return new Tensor($outputStorage->shape(), $outputStorage);
+    }
+
+    public function bertSelfAttention(
+        Tensor $input,
+        Tensor $qWeight,
+        Tensor $qBias,
+        Tensor $kWeight,
+        Tensor $kBias,
+        Tensor $vWeight,
+        Tensor $vBias,
+        Tensor $outWeight,
+        Tensor $outBias,
+        int $heads,
+        ?AttentionMask $mask = null,
+    ): Tensor {
+        $storages = [];
+        foreach ([$input, $qWeight, $qBias, $kWeight, $kBias, $vWeight, $vBias, $outWeight, $outBias] as $tensor) {
+            $storage = $tensor->storage();
+            if (!$storage instanceof NativeStorage) {
+                throw new \LogicException('BERT self-attention requires native storage.');
+            }
+            $storages[] = $storage;
+        }
+
+        [$inputStorage, $qWeightStorage, $qBiasStorage, $kWeightStorage, $kBiasStorage, $vWeightStorage, $vBiasStorage, $outWeightStorage, $outBiasStorage] = $storages;
+        $outputStorage = $inputStorage->bertSelfAttention(
+            $qWeightStorage,
+            $qBiasStorage,
+            $kWeightStorage,
+            $kBiasStorage,
+            $vWeightStorage,
+            $vBiasStorage,
+            $outWeightStorage,
+            $outBiasStorage,
+            $heads,
+            $mask,
+            $this->ffi,
+        );
+
+        return new Tensor($outputStorage->shape(), $outputStorage);
+    }
+
     public function multiHeadAttention(
         Tensor $input,
         Tensor $qWeight,

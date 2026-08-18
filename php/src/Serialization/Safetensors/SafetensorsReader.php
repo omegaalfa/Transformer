@@ -281,6 +281,7 @@ final class SafetensorsReader implements SafetensorsReaderInterface
             'F32' => DType::Float32,
             'F16' => DType::Float16,
             'BF16' => DType::BFloat16,
+            'I64' => DType::Int64,
             'I8' => DType::Int8,
             default => throw new SerializationException(sprintf(
                 'Tensor "%s" uses unsupported Safetensors dtype "%s".',
@@ -343,6 +344,7 @@ final class SafetensorsReader implements SafetensorsReaderInterface
         $bytesPerElement = match ($dtype) {
             DType::Float32 => 4,
             DType::Float16, DType::BFloat16 => 2,
+            DType::Int64 => 8,
             DType::Int8 => 1,
             DType::Int4 => throw new SerializationException('Int4 is not a supported Safetensors storage dtype.'),
         };

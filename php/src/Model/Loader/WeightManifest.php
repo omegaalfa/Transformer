@@ -11,8 +11,14 @@ final readonly class WeightManifest
     /** @var list<CheckpointParameterSpec> */
     public array $parameters;
 
-    /** @param list<CheckpointParameterSpec> $parameters */
-    public function __construct(array $parameters)
+    /** @var list<string> */
+    public array $ignoredCheckpointTensors;
+
+    /**
+     * @param list<CheckpointParameterSpec> $parameters
+     * @param list<string>                  $ignoredCheckpointTensors
+     */
+    public function __construct(array $parameters, array $ignoredCheckpointTensors = [])
     {
         $checkpointNames = [];
         $parameterNames = [];
@@ -35,6 +41,14 @@ final readonly class WeightManifest
             $parameterNames[$parameter->parameterName] = true;
         }
 
+        foreach ($ignoredCheckpointTensors as $name) {
+            if ($name === '' || isset($checkpointNames[$name])) {
+                throw new InvalidArgumentException('Ignored checkpoint tensor names must be non-empty and disjoint from Parameters.');
+            }
+            $checkpointNames[$name] = true;
+        }
+
         $this->parameters = $parameters;
+        $this->ignoredCheckpointTensors = $ignoredCheckpointTensors;
     }
 }

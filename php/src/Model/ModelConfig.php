@@ -16,6 +16,10 @@ final readonly class ModelConfig
         public TransformerConfig $transformer,
         public DType $dtype = DType::Float32,
         public Device $device = Device::CPU,
+        public int $maxPositionEmbeddings = 0,
+        public int $typeVocabularySize = 0,
+        public string $activation = 'gelu_tanh',
+        public string $positionEmbeddingType = 'none',
     ) {
     }
 }

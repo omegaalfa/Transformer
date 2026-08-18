@@ -71,12 +71,33 @@ int transformer_tensor_gelu(
     TransformerTensor** output
 );
 
+int transformer_tensor_exact_gelu(
+    const TransformerTensor* input,
+    TransformerTensor** output
+);
+
 int transformer_tensor_multi_head_attention(
     const TransformerTensor* input,
     const TransformerTensor* q_weight,
     const TransformerTensor* k_weight,
     const TransformerTensor* v_weight,
     const TransformerTensor* out_weight,
+    size_t heads,
+    const uint8_t* mask,
+    size_t mask_length,
+    TransformerTensor** output
+);
+
+int transformer_tensor_bert_self_attention(
+    const TransformerTensor* input,
+    const TransformerTensor* q_weight,
+    const TransformerTensor* q_bias,
+    const TransformerTensor* k_weight,
+    const TransformerTensor* k_bias,
+    const TransformerTensor* v_weight,
+    const TransformerTensor* v_bias,
+    const TransformerTensor* out_weight,
+    const TransformerTensor* out_bias,
     size_t heads,
     const uint8_t* mask,
     size_t mask_length,

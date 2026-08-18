@@ -25,6 +25,9 @@ final readonly class SafetensorsWeightLoader implements WeightLoaderInterface
         foreach ($this->manifest->parameters as $parameter) {
             $expectedNames[$parameter->checkpointName] = true;
         }
+        foreach ($this->manifest->ignoredCheckpointTensors as $name) {
+            $expectedNames[$name] = true;
+        }
 
         $actualNames = array_fill_keys(array_keys($weightMap->tensors), true);
         $missing = array_keys(array_diff_key($expectedNames, $actualNames));

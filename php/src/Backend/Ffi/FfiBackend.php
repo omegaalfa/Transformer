@@ -7,11 +7,12 @@ namespace Omegaalfa\Transformer\Backend\Ffi;
 use InvalidArgumentException;
 use Omegaalfa\Transformer\Backend\AbstractBackend;
 use Omegaalfa\Transformer\Backend\BackendType;
+use Omegaalfa\Transformer\Backend\Contract\BertBackendInterface;
 use Omegaalfa\Transformer\Tensor\Shape;
 use Omegaalfa\Transformer\Tensor\Tensor;
 use Omegaalfa\Transformer\Transformer\AttentionMask;
 
-final class FfiBackend extends AbstractBackend
+final class FfiBackend extends AbstractBackend implements BertBackendInterface
 {
     public function __construct(private readonly NativeLibrary $nativeLibrary)
     {
@@ -100,6 +101,39 @@ final class FfiBackend extends AbstractBackend
     public function gelu(Tensor $input): Tensor
     {
         return $this->nativeLibrary->gelu($input);
+    }
+
+    public function exactGelu(Tensor $input): Tensor
+    {
+        return $this->nativeLibrary->exactGelu($input);
+    }
+
+    public function bertSelfAttention(
+        Tensor $input,
+        Tensor $qWeight,
+        Tensor $qBias,
+        Tensor $kWeight,
+        Tensor $kBias,
+        Tensor $vWeight,
+        Tensor $vBias,
+        Tensor $outWeight,
+        Tensor $outBias,
+        int $heads,
+        ?AttentionMask $mask = null,
+    ): Tensor {
+        return $this->nativeLibrary->bertSelfAttention(
+            $input,
+            $qWeight,
+            $qBias,
+            $kWeight,
+            $kBias,
+            $vWeight,
+            $vBias,
+            $outWeight,
+            $outBias,
+            $heads,
+            $mask,
+        );
     }
 
     public function multiHeadAttention(

@@ -1,7 +1,9 @@
 pub mod add;
 pub mod attention;
+pub mod bert_attention;
 mod blas;
 pub mod embedding;
+pub mod exact_gelu;
 pub mod gelu;
 pub mod layer_norm;
 pub mod linear;

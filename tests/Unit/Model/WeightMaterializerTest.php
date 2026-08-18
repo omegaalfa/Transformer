@@ -116,6 +116,7 @@ final class WeightMaterializerTest extends TestCase
     {
         yield 'Float16' => [DType::Float16, [1], "\0\0"];
         yield 'BFloat16' => [DType::BFloat16, [1], "\0\0"];
+        yield 'Int64' => [DType::Int64, [1], str_repeat("\0", 8)];
         yield 'Int8' => [DType::Int8, [1], "\0"];
     }
 

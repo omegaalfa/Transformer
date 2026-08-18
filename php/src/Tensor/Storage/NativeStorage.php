@@ -246,6 +246,68 @@ final class NativeStorage implements StorageInterface
         return $this->unary('transformer_tensor_gelu');
     }
 
+    public function exactGelu(FFI $runtimeFfi): self
+    {
+        if ($this->ffi !== $runtimeFfi) {
+            throw new LogicException('Native tensor belongs to a different runtime instance.');
+        }
+
+        return $this->unary('transformer_tensor_exact_gelu');
+    }
+
+    public function bertSelfAttention(
+        self $qWeight,
+        self $qBias,
+        self $kWeight,
+        self $kBias,
+        self $vWeight,
+        self $vBias,
+        self $outWeight,
+        self $outBias,
+        int $heads,
+        ?AttentionMask $mask,
+        FFI $runtimeFfi,
+    ): self {
+        $arguments = [$qWeight, $qBias, $kWeight, $kBias, $vWeight, $vBias, $outWeight, $outBias];
+        foreach ($arguments as $tensor) {
+            if ($this->ffi !== $tensor->ffi || $this->ffi !== $runtimeFfi) {
+                throw new LogicException('Native tensors belong to different runtime instances.');
+            }
+        }
+        $maskBuffer = null;
+        $maskLength = 0;
+        if ($mask !== null) {
+            $maskLength = count($mask->values);
+            $maskBuffer = $this->ffi->new('uint8_t[' . max(1, $maskLength) . ']');
+            foreach ($mask->values as $index => $value) {
+                // @phpstan-ignore offsetAccess.nonOffsetAccessible (FFI C array.)
+                $maskBuffer[$index] = $value ? 1 : 0;
+            }
+        }
+        $output = $this->ffi->new('TransformerTensor *[1]');
+        $this->requireStatus(
+            // @phpstan-ignore method.notFound (Native methods are defined by FFI::cdef().)
+            $this->ffi->transformer_tensor_bert_self_attention(
+                $this->handle(),
+                $qWeight->handle(),
+                $qBias->handle(),
+                $kWeight->handle(),
+                $kBias->handle(),
+                $vWeight->handle(),
+                $vBias->handle(),
+                $outWeight->handle(),
+                $outBias->handle(),
+                $heads,
+                $maskBuffer,
+                $maskLength,
+                $output,
+            ),
+            'transformer_tensor_bert_self_attention',
+        );
+
+        return new self($this->ffi, $output[0]);
+    }
+
     public function multiHeadAttention(
         self $qWeight,
         self $kWeight,

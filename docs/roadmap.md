@@ -7,7 +7,8 @@
 - [ ] **Milestone E** — Zend extension consuming the Rust C ABI.
 - [ ] **Milestone F** — real encoder and Safetensors (validated metadata,
   selective payload reading, Float32 materialization and closed Parameter
-  manifests complete; BERT config/model construction pending).
+  manifests plus BERT config/model construction complete; tokenizer and
+  sentence-embedding wrapper pending).
 - [ ] **Milestone G** — ContextEngine integration.
 - [ ] **Milestone H** — CPU optimization after profiling (tiled matmul and optional BLAS complete; SIMD and threads pending).
 - [ ] **Milestone I** — decoder and KV cache.
@@ -97,7 +98,7 @@ The model-loading foundation is also staged independently:
 - [x] **MODEL-R2C** — strict Float32 Tensor materialization and documented
   PyTorch Linear transposition.
 - [x] **MODEL-R2D** — closed manifest mapping to resident Parameters.
-- [ ] **MODEL-R2E** — config validation and atomic BERT-compatible model
+- [x] **MODEL-R2E** — config validation and atomic BERT-compatible model
   construction.
 
 See [`nn-design.md`](nn-design.md) for the decisions and deferred scope.

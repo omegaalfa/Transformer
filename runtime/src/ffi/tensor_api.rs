@@ -4,7 +4,9 @@ use std::ptr;
 
 use crate::kernels::add::add_f32;
 use crate::kernels::attention::multi_head_attention_f32;
+use crate::kernels::bert_attention::bert_self_attention_f32;
 use crate::kernels::embedding::embedding_f32;
+use crate::kernels::exact_gelu::exact_gelu_f32;
 use crate::kernels::gelu::gelu_f32;
 use crate::kernels::layer_norm::layer_norm_f32;
 use crate::kernels::linear::linear_last_dim_f32;
@@ -669,6 +671,42 @@ pub unsafe extern "C" fn transformer_tensor_gelu(
     .unwrap_or(STATUS_PANIC)
 }
 
+/// Applies exact erf-based GELU elementwise into a new owned Tensor.
+#[no_mangle]
+pub unsafe extern "C" fn transformer_tensor_exact_gelu(
+    input: *const TransformerTensor,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    unsafe { output.write(ptr::null_mut()) };
+    if input.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        let input = unsafe { &*input }.tensor();
+        if input.dtype() != DType::Float32
+            || input.strides() != &Strides::contiguous(input.shape())
+            || input.as_slice().len() != input.numel()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let mut values = vec![0.0; input.numel()];
+        if exact_gelu_f32(input.as_slice(), &mut values).is_err() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Ok(tensor) = Tensor::from_vec(values, input.shape().clone()) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
 /// Materializes the transpose of a rank-2 Float32 Tensor.
 ///
 /// # Safety
@@ -935,6 +973,118 @@ pub unsafe extern "C" fn transformer_tensor_multi_head_attention(
         };
         let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
         // SAFETY: `output` is writable and published once after complete success.
+        unsafe { output.write(handle) };
+        STATUS_OK
+    }))
+    .unwrap_or(STATUS_PANIC)
+}
+
+/// Computes BERT-compatible non-causal self-attention with projection biases.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn transformer_tensor_bert_self_attention(
+    input: *const TransformerTensor,
+    q_weight: *const TransformerTensor,
+    q_bias: *const TransformerTensor,
+    k_weight: *const TransformerTensor,
+    k_bias: *const TransformerTensor,
+    v_weight: *const TransformerTensor,
+    v_bias: *const TransformerTensor,
+    out_weight: *const TransformerTensor,
+    out_bias: *const TransformerTensor,
+    heads: usize,
+    mask: *const u8,
+    mask_length: usize,
+    output: *mut *mut TransformerTensor,
+) -> c_int {
+    if output.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    unsafe { output.write(ptr::null_mut()) };
+    let pointers = [
+        input, q_weight, q_bias, k_weight, k_bias, v_weight, v_bias, out_weight, out_bias,
+    ];
+    if pointers.iter().any(|pointer| pointer.is_null()) || (mask.is_null() && mask_length != 0) {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    catch_unwind(AssertUnwindSafe(|| {
+        let tensors: Vec<&Tensor> = pointers
+            .iter()
+            .map(|pointer| unsafe { &**pointer }.tensor())
+            .collect();
+        let input = tensors[0];
+        let weights = [tensors[1], tensors[3], tensors[5], tensors[7]];
+        let biases = [tensors[2], tensors[4], tensors[6], tensors[8]];
+        if input.dtype() != DType::Float32
+            || input.rank() != 3
+            || input.strides() != &Strides::contiguous(input.shape())
+            || weights.iter().any(|tensor| {
+                tensor.dtype() != DType::Float32
+                    || tensor.rank() != 2
+                    || tensor.strides() != &Strides::contiguous(tensor.shape())
+            })
+            || biases.iter().any(|tensor| {
+                tensor.dtype() != DType::Float32
+                    || tensor.rank() != 1
+                    || tensor.strides() != &Strides::contiguous(tensor.shape())
+            })
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let shape = input.shape().as_slice();
+        let (batch, sequence, dimensions) = (shape[0], shape[1], shape[2]);
+        if dimensions == 0
+            || heads == 0
+            || dimensions % heads != 0
+            || weights
+                .iter()
+                .any(|tensor| tensor.shape().as_slice() != [dimensions, dimensions])
+            || biases
+                .iter()
+                .any(|tensor| tensor.shape().as_slice() != [dimensions])
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(expected_mask_length) = batch.checked_mul(sequence) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let mask = if mask.is_null() {
+            None
+        } else {
+            if mask_length != expected_mask_length
+                || mask_length > isize::MAX as usize / size_of::<u8>()
+            {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            Some(unsafe { std::slice::from_raw_parts(mask, mask_length) })
+        };
+        let mut values = vec![0.0; input.numel()];
+        if bert_self_attention_f32(
+            input.as_slice(),
+            weights[0].as_slice(),
+            biases[0].as_slice(),
+            weights[1].as_slice(),
+            biases[1].as_slice(),
+            weights[2].as_slice(),
+            biases[2].as_slice(),
+            weights[3].as_slice(),
+            biases[3].as_slice(),
+            mask,
+            &mut values,
+            batch,
+            sequence,
+            dimensions,
+            heads,
+        )
+        .is_err()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Ok(tensor) = Tensor::from_vec(values, input.shape().clone()) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let handle = Box::into_raw(Box::new(TransformerTensor::new(tensor)));
         unsafe { output.write(handle) };
         STATUS_OK
     }))
